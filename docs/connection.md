@@ -1,140 +1,209 @@
 # fsh Connection Protocol
 
 Service name: `fsh-connection`. Runs after transport establishment and
-user authentication, multiplexed over the authenticated QUIC connection.
+user authentication, multiplexed over the authenticated QUIC connection
+(RFC 9000 streams; RFC 4254 channel concepts adapted to QUIC).
 
-## Overview
+## 1. Framing
 
-The connection protocol provides interactive and non-interactive command
-execution. One channel type exists: `session`. Each session channel carries
-at most one of `shell`, `exec`, or `subsystem`. Exit state and signals are
-reported as channel requests.
+EVERY fsh message on ANY stream is framed as:
 
-Message numbers:
+```
+u32-BE length || u8 msg-number || payload[length-1]
+```
 
-- 80-82: global requests.
-- 90-97: channel open / data / close.
-- 98-100: channel requests and replies.
+`length` covers type byte + payload. There is no bare msg-number
+framing anywhere. A sender MAY place multiple framed messages in one
+QUIC stream write; a receiver MUST reassemble by the length prefix.
+QUIC stream segments (STREAM frames, chunk boundaries) have no message
+meaning: one DATA message NEVER equals one stream segment, and a
+receiver MUST NOT treat a chunk boundary as a message boundary.
 
-All messages are sent on the control stream except channel payload, which
-travels on the channel's own QUIC stream (see below).
+## 2. Streams and channel identifiers
 
-## Channels over QUIC streams
-
-A channel IS a QUIC bidirectional stream. Opening a channel = opening a
-stream and sending `CHANNEL_OPEN`; closing = sending `CHANNEL_CLOSE` and
-closing the stream.
-
-- Either side MAY open a channel at any time after authentication.
-- Each endpoint numbers its channels independently with uint32 local ids.
-  The pair (initiator, local id) maps 1:1 to a QUIC stream id. Channel ids
-  MUST NOT be reused within a connection.
-- Channel types: only `session`. Unknown types MUST be rejected with
-  `CHANNEL_OPEN_FAILURE` (reason 3, "unknown channel type").
+- QUIC stream 0 (client-initiated bidirectional) is the control stream
+  and is reserved for connection-protocol control messages. No channel
+  data travels on stream 0.
+- Channels are client-initiated bidirectional QUIC streams only
+  (client streams 4, 8, 12, ...). Channel id is derived, never
+  negotiated: `channel id = stream_id / 4` as uint32 (stream 4 = channel
+  1, stream 8 = channel 2, ...). There are NO server-initiated channels
+  in v0; a server MUST NOT open a channel stream and a client MUST
+  reject any server-initiated channel attempt.
+- All channel lifecycle messages (90-92, 96-100, 80-82) travel on the
+  control stream and reference the uint32 channel id. Only DATA traffic
+  (94, 95) travels on the channel's own stream, itself framed per
+  Section 1.
+- Channel type: only `session`. A request for any other type MUST be
+  rejected with `CHANNEL_OPEN_FAILURE` (reason 3, unknown channel type).
 - Flow control is QUIC stream/connection flow control (`MAX_DATA`,
-  `MAX_STREAM_DATA`). There is no window mechanism in fsh.
-- Directional shutdown maps to EOF: `FIN` on the send part of a stream is
-  equivalent to `CHANNEL_EOF`. After both directions are closed the stream
-  is discarded; no further messages for that channel are valid.
+  `MAX_STREAM_DATA`, RFC 9000). There is no `WINDOW_ADJUST` window
+  mechanism in fsh; message 93 is reserved, MUST NOT be sent, MUST be
+  treated as unknown per Section 9.
 
-## Channel messages
+## 3. Channel lifecycle messages (control stream)
 
-| #  | Name                   | Notes                                          |
-|----|------------------------|------------------------------------------------|
-| 90 | CHANNEL_OPEN           | type name, sender channel, initial reserved    |
-| 91 | CHANNEL_OPEN_CONFIRM   | recipient channel, sender channel              |
-| 92 | CHANNEL_OPEN_FAILURE   | recipient channel, reason code, description    |
-| 93 | WINDOW_ADJUST          | RESERVED. MUST NOT send; MUST ignore on receipt|
-| 94 | CHANNEL_DATA           | payload bytes on the channel's QUIC stream     |
-| 95 | CHANNEL_EXTENDED_DATA  | only type 1 (stderr); others MUST be rejected  |
-| 96 | CHANNEL_EOF            | no more data will be sent; maps to stream FIN  |
-| 97 | CHANNEL_CLOSE          | channel teardown; maps to stream close         |
+All fields use SSH wire types (RFC 4251): `byte`, `uint32`, `string`
+(u32-BE length || bytes).
 
-`CHANNEL_OPEN` carries: channel type (`session`), sender channel id, and a
-reserved uint32 (MUST be 0; replaces the SSH window/packet-size fields).
-Receivers MUST ignore the reserved field.
+| #  | Name                   | Wire grammar (after framing header)        |
+|----|------------------------|--------------------------------------------|
+| 90 | CHANNEL_OPEN           | `string "session" || uint32 channel-id`    |
+| 91 | CHANNEL_OPEN_CONFIRM   | `uint32 channel-id`                        |
+| 92 | CHANNEL_OPEN_FAILURE   | `uint32 channel-id || uint32 reason || string description || string language` |
+| 96 | CHANNEL_EOF            | `uint32 channel-id`                        |
+| 97 | CHANNEL_CLOSE          | `uint32 channel-id`                        |
 
-`CHANNEL_OPEN_FAILURE` reason codes follow SSH (`1` administratively
-prohibited, `2` connect failed, `3` unknown channel type, `4` resource
-shortage). fsh adds no new codes.
+Open procedure:
 
-`CHANNEL_DATA` / `CHANNEL_EXTENDED_DATA` are framing markers only; the
-bytes themselves are the QUIC stream payload. One DATA message corresponds
-to one contiguous stream segment.
+1. Client opens a bidirectional QUIC stream (4, 8, 12, ...) and sends
+   `CHANNEL_OPEN` on the control stream with the derived channel id.
+2. Server replies on the control stream with exactly one of
+   `CHANNEL_OPEN_CONFIRM` or `CHANNEL_OPEN_FAILURE`.
+3. `CHANNEL_OPEN_FAILURE` reason codes follow SSH (1 administratively
+   prohibited, 2 connect failed, 3 unknown channel type, 4 resource
+   shortage). fsh adds no new codes. `description` is human-readable
+   UTF-8, `language` is a BCP 47 tag (MAY be empty).
 
-## Channel requests (kept + dropped)
+Channel ids MUST NOT be reused within a connection.
 
-Request framing: msg 98 (`CHANNEL_REQUEST`: recipient channel, type name,
-want-reply, type data), 99 (`CHANNEL_SUCCESS`), 100 (`CHANNEL_FAILURE`).
-`want-reply` follows SSH semantics; exit and signal notifications use
-`want-reply = false`.
+## 4. Data transfer (channel stream, framed)
 
-Kept:
+`CHANNEL_DATA` (94) and `CHANNEL_EXTENDED_DATA` (95) travel on the
+channel's own stream as framed messages per Section 1. Direction
+disambiguates the standard stream:
 
-- `shell` — interactive shell. Requires a prior `pty-req` for terminal
-  use; without one the server MAY attach a dumb pipe instead of failing.
-- `exec` — single command; data is the command string (UTF-8, max 16 KiB).
-- `subsystem` — only value `fcp` (file copy). All other names MUST fail.
-- `pty-req` — minimal allocation for interactive shell: `TERM` (max 64
-  chars), width/height in chars, width/height in pixels, empty modes list.
-  Non-empty terminal modes MUST be rejected.
-- `window-change` — pty resize companion to `pty-req` only. MUST be ignored
-  on channels without a pty.
-- `signal` — signal name (e.g. `TERM`, `KILL`, `INT`, `HUP`); delivers to
-  the process group of the session.
-- `exit-status` — uint32 exit code, server to client, terminal state.
-- `exit-signal` — signal name + core-dumped flag + message + language tag,
-  server to client, terminal state. Mutually exclusive with `exit-status`.
+| #  | Name                  | Direction       | Meaning | Grammar (after header) |
+|----|-----------------------|-----------------|---------|------------------------|
+| 94 | CHANNEL_DATA          | client -> server | stdin  | `uint32 channel-id \|\| string data` |
+| 94 | CHANNEL_DATA          | server -> client | stdout | `uint32 channel-id \|\| string data` |
+| 95 | CHANNEL_EXTENDED_DATA | server -> client | stderr | `uint32 channel-id \|\| uint32 type=1 \|\| string data` |
 
-Dropped (server MUST reject with `CHANNEL_FAILURE`):
+- The `channel-id` in each DATA frame MUST equal the id derived from
+  the stream it travels on; a mismatch MUST cause the receiver to send
+  `CHANNEL_CLOSE` for that channel.
+- Extended-data type 1 is stderr. No other extended-data type is
+  defined in v0; a sender MUST NOT send any other type and a receiver
+  MUST reject the channel (send `CHANNEL_CLOSE`) on receipt.
+- `CHANNEL_EXTENDED_DATA` in the client -> server direction is
+  undefined in v0 and MUST be rejected with `CHANNEL_CLOSE`.
+- Stdin, stdout, and stderr are three distinct frame types above; a
+  single DATA frame carries bytes for exactly one of them. Stream
+  segments MUST NOT be interpreted as message boundaries.
 
-- `env` — no environment passing. Locale and caller environment are never
-  forwarded; the server exec environment is fixed by policy.
-- `x11-req`, `x11-fwd` — no X11 forwarding.
-- `xon-xoff` — no flow-control override.
-- `auth-agent-req@openssh.com` and any forwarding bindings — no agent
-  forwarding.
-- Any `tcpip-forward`, `direct-tcpip`, `forwarded-tcpip` channel types or
-  requests — no TCP forwarding of any kind.
+## 5. Shutdown reconciliation
 
-## Sessions (shell/exec/subsystem)
+Sender half-close (QUIC FIN) on a channel stream means EOF for that
+direction. `CHANNEL_EOF` (96) is sent on the control stream, then FIN
+follows on the indicated data direction. `CHANNEL_CLOSE` (97) goes on
+the control stream. After both sides have sent `CHANNEL_CLOSE`, each
+endpoint issues `RESET_STREAM` / `STOP_SENDING` (RFC 9000) on any
+residual direction and discards all channel state; no further messages
+for that channel are valid.
 
-A `session` channel carries exactly one program binding:
+| Event | Who sends | On which stream | Meaning / required action |
+|-------|-----------|-----------------|---------------------------|
+| Client stdin end | client | control: `CHANNEL_EOF(channel-id)`; then FIN on client -> server direction of the channel stream | no more stdin; server MAY keep stdout/stderr open |
+| Server stdout/stderr end | server | control: `CHANNEL_EOF(channel-id)`; then FIN on server -> client direction of the channel stream | no more output; preceded by exactly one of `exit-status` / `exit-signal` |
+| QUIC FIN received | transport | channel stream direction | EOF for that direction only; equivalent to having received `CHANNEL_EOF` if the control message was lost; MUST NOT be treated as full close |
+| `CHANNEL_CLOSE` | either side | control stream | "I am done with this channel"; sender MUST NOT send further messages for the channel except its own duplicate CLOSE handling |
+| Both sides sent `CHANNEL_CLOSE` | both | control stream (each direction) | channel is dead; each endpoint MUST `RESET_STREAM` / `STOP_SENDING` any residual open direction, then discard state |
+| Half-open leftover (FIN without EOF, or EOF without FIN) | receiver | — | receiver MUST tolerate either order; a FIN without a preceding `CHANNEL_EOF` is still EOF; an EOF without a following FIN MUST be followed by connection-idle cleanup via `CHANNEL_CLOSE` |
 
-1. Client sends `CHANNEL_OPEN` (`session`) and receives
-   `CHANNEL_OPEN_CONFIRM`.
-2. Client sends at most one of `shell`, `exec`, or `subsystem`. A second
-   binding request on the same channel MUST fail. Implementations MAY close
-   the channel after the second attempt.
-3. Optional `pty-req` MUST precede `shell` when a terminal is wanted;
-   `pty-req` before `exec` requests a pty for that command and MAY be
-   refused by policy. `pty-req` with `subsystem` MUST be refused.
-4. Data flows over the channel's stream: stdin/stdout as `CHANNEL_DATA`,
-   stderr as `CHANNEL_EXTENDED_DATA` type 1.
-5. Termination: server sends exactly one of `exit-status` or `exit-signal`,
-   then `CHANNEL_EOF` and `CHANNEL_CLOSE`. Client closes its send direction
-   when stdin ends, then the channel with `CHANNEL_CLOSE` after reading EOF.
+Normal termination order (server side): `exit-status` or `exit-signal`
+(98, `want-reply=false`), then `CHANNEL_EOF`, then FIN on the
+server -> client direction, then `CHANNEL_CLOSE`. Client closes its
+send direction when stdin ends, and sends `CHANNEL_CLOSE` after reading
+EOF and the exit notification.
 
-Global requests (80 `GLOBAL_REQUEST`, 81 `REQUEST_SUCCESS`,
-82 `REQUEST_FAILURE`): no forwarding or listener requests exist. The only
-permitted global request is `keepalive@fsh.dev` (`want-reply = true`,
-empty data) for dead-peer detection. All other global requests MUST fail
-with `REQUEST_FAILURE`.
+## 6. Channel requests
 
-## SSH differences
+Request framing on the control stream: 98 (`CHANNEL_REQUEST`:
+`uint32 channel-id || string type-name || boolean want-reply || ...type
+data`), 99 (`CHANNEL_SUCCESS`: `uint32 channel-id`), 100
+(`CHANNEL_FAILURE`: `uint32 channel-id`). `want-reply` follows SSH
+semantics; exit and signal notifications use `want-reply = false`.
 
-| SSH (RFC 4254)              | fsh                                        |
-|-----------------------------|--------------------------------------------|
-| Channels multiplex one TCP stream | Each channel is a QUIC bidi stream  |
-| `WINDOW_ADJUST` (93) flow control | Dropped; QUIC flow control only     |
-| `OPEN` window / max-packet fields | Reserved uint32, MUST be 0         |
-| `env` request               | Dropped                                    |
-| `x11-req`, X11 channels     | Dropped                                    |
-| `tcpip-forward`, `direct-tcpip`, `forwarded-tcpip`, `auth-agent-req` | Dropped; no forwarding of any kind |
-| Arbitrary subsystems        | Only `fcp`                                 |
-| `xon-xoff`                  | Dropped                                    |
-| Compression negotiation     | None; QUIC handles the path                |
-| Rekey / sequence replay     | None; TLS 1.3 key update governs           |
+A `session` channel carries at most one program binding (`shell`,
+`exec`, or `subsystem`). A second binding request on the same channel
+MUST fail with `CHANNEL_FAILURE`; implementations MAY then send
+`CHANNEL_CLOSE`.
 
-Numbers unchanged from SSH: 80-82 global, 90-97 channel lifecycle,
-98-100 channel requests. Message 93 is reserved and never sent.
+Kept requests and wire grammars (type-data after the request header):
+
+- `shell` (`want-reply=true`): no further fields. Starts the user's
+  default shell. Requires a prior `pty-req` for terminal use; without
+  one the server attaches pipes.
+- `exec` (`want-reply=true`): `string command`. `command` is UTF-8,
+  MUST NOT contain NUL bytes, max 16384 bytes. The server executes it
+  without a shell search-path interpolation; no environment passing —
+  locale and caller environment are never forwarded and the server exec
+  environment is fixed by policy.
+- `pty-req` (`want-reply=true`):
+  `string TERM || uint32 cols || uint32 rows || uint32 px-width || uint32 px-height || string modes`.
+  Minimal allocation for interactive use: `TERM` 1-64 printable ASCII
+  chars; `cols`/`rows` 1..1024; `px-width`/`px-height` 0..8192 (0 means
+  unspecified); `modes` MUST be empty (MUST send zero length; non-empty
+  MUST be rejected with `CHANNEL_FAILURE`). `pty-req` MUST precede
+  `shell` when a terminal is wanted; before `exec` it requests a pty
+  for that command and MAY be refused by policy; with `subsystem` it
+  MUST be refused.
+- `window-change` (`want-reply=false`):
+  `uint32 cols || uint32 rows || uint32 px-width || uint32 px-height`
+  with the same bounds as `pty-req`. Pty resize companion only; MUST be
+  ignored on channels without a pty.
+- `signal` (`want-reply=false`): `string signal-name`. ASCII
+  uppercase, max 16 chars; defined values `HUP INT QUIT ILL TRAP ABRT
+  BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM CHLD CONT STOP TSTP URG`.
+  Unknown names MUST be ignored. Delivers to the process group of the
+  session (see cleanup below).
+- `exit-status` (`want-reply=false`, server -> client):
+  `uint32 exit-code`. Terminal state; mutually exclusive with
+  `exit-signal`.
+- `exit-signal` (`want-reply=false`, server -> client):
+  `string signal-name || boolean core-dumped || string message || string language`.
+  Terminal state; mutually exclusive with `exit-status`.
+
+Process-cleanup semantics: the session process runs in its own process
+group. `CHANNEL_CLOSE` from either side kills the process group
+(equivalent to `SIGKILL` after a grace period for `exit-status` /
+`exit-signal` delivery), revokes the pty, and releases the channel.
+A `signal` request with `KILL` takes effect immediately on the group.
+
+## 7. Subsystems
+
+The `subsystem` request mechanism stays:
+`subsystem` (`want-reply=true`): `string subsystem-name` (max 64 chars,
+lowercase-hyphenated or `name@fqdn`). No subsystems are assigned in v0.
+`fcp` (file copy) is deferred past v0: servers MUST reply
+`CHANNEL_FAILURE` to any `subsystem` request in v0, and no fcp wire
+format is defined by this document.
+
+## 8. Global requests
+
+Framing on the control stream: 80 (`GLOBAL_REQUEST`:
+`string name || boolean want-reply || ...request data`), 81
+(`REQUEST_SUCCESS`: no fields beyond the header for `keepalive@fsh.dev`),
+82 (`REQUEST_FAILURE`). The only permitted global request in v0 is:
+
+- `keepalive@fsh.dev` (`want-reply=true`, empty data): dead-peer
+  detection. The recipient replies `REQUEST_SUCCESS` with empty data.
+  All other global requests MUST fail with `REQUEST_FAILURE`. No
+  forwarding or listener requests exist in v0.
+
+## 9. Unknown-message handling
+
+An unknown message number in an assigned range received on the control
+stream MUST elicit UNIMPLEMENTED (3); an unknown message number in
+192-255 MUST be ignored.
+
+## 10. Excluded in v0
+
+Only the `session` channel type exists. There is no TCP forwarding, no
+X11, no agent forwarding, no environment passing, no flow-control
+override, and no compression negotiation (QUIC handles the path; TLS
+1.3 key update governs rekey). Message 93 (`WINDOW_ADJUST`) is
+reserved and never sent.
+
+Numbers used here match the shared registry: 80-82 global, 90-97
+channel lifecycle, 98-100 channel requests (93 reserved, never sent).

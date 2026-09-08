@@ -19,10 +19,14 @@ client (proves identity); the other is the server (authorizes access).
   invalid; servers MUST reject it.
 - Algorithm names are lowercase-hyphenated, max 64 chars. Local
   extensions use `name@fqdn` form.
-- Session identifier: 32+ bytes derived from the TLS 1.3 handshake
-  (exporter with a fixed label, see transport doc). All signatures
-  cover it. It binds authentication to this connection; replays on
-  another connection fail verification.
+- Session identifier: exactly 32 bytes from the TLS 1.3 exporter
+  (RFC 8446, Section 7.5) with label "fsh-binding-v0" and empty
+  context. All signatures cover it. It binds authentication to this
+  connection; replays on another connection fail verification.
+  QUIC connection IDs are routing identifiers and MUST NOT be
+  described or used as bindings. There is no handshake-hash field.
+  Handshakes without (EC)DHE (PSK-only, no forward secrecy) MUST
+  be refused.
 
 ## 2. Message flow
 
@@ -57,7 +61,10 @@ Flow:
    `fsh-connection`) or `FAILURE(51)` (attempt rejected, may retry).
 3. `FAILURE` continuations list contains exactly `"publickey"`.
    Clients MUST NOT interpret any other name; servers MUST NOT send
-   any other name.
+   any other name. This name-list is the sole pubkey-algorithm
+   advertisement: there is no separate advertisement message, no
+   `EXT_INFO` (7-19 stay reserved), and no extension negotiation for
+   algorithms.
 4. Unrecognized methods: server MUST reply `FAILURE(51)` with
    `["publickey"]`. There is no fallback negotiation.
 5. Servers SHOULD rate-limit and cap consecutive failures (RECOMMENDED:
@@ -130,32 +137,48 @@ string    public-key blob
 - A `PK_OK(60)` received without a preceding probe (unsolicited) MUST
   be ignored.
 
-## 4. Key types
-
 ### 4.1 Supported
 
-| Wire name              | Key / signature scheme              | Notes                          |
-|------------------------|-------------------------------------|--------------------------------|
-| `ssh-ed25519`          | Ed25519                             | RECOMMENDED default            |
-| `ssh-ed448`            | Ed448                               | where implementation provides  |
-| `ecdsa-sha2-nistp256`  | ECDSA P-256 + SHA-256               |                                |
-| `ecdsa-sha2-nistp384`  | ECDSA P-384 + SHA-384               |                                |
-| `ecdsa-sha2-nistp521`  | ECDSA P-521 + SHA-512               |                                |
-| `rsa-sha2-256`         | RSA >= 3072 bit + SHA-256 (PSS)     | keys < 3072 bit MUST be refused|
-| `rsa-sha2-512`         | RSA >= 3072 bit + SHA-512 (PSS)     | keys < 3072 bit MUST be refused|
-| `sk-ssh-ed25519`       | FIDO2 Resident/non-resident Ed25519 | wire includes flags, counter,  |
-| `sk-ecdsa-sha2-*`      | FIDO2 ECDSA (P-256)                 | `sk-ecdsa-sha2-nistp256`; attested |
+| Wire name (OpenSSH-interop)              | Key / signature scheme                          | Notes                          |
+|------------------------------------------|-------------------------------------------------|--------------------------------|
+| `ssh-ed25519`                            | Ed25519 per RFC 8032                            | RECOMMENDED default            |
+| `ssh-ed448`                              | Ed448 per RFC 8032 (see below)                  | full spec below                |
+| `ecdsa-sha2-nistp256`                    | ECDSA P-256 + SHA-256                           |                                |
+| `ecdsa-sha2-nistp384`                    | ECDSA P-384 + SHA-384                           |                                |
+| `ecdsa-sha2-nistp521`                    | ECDSA P-521 + SHA-512                           |                                |
+| `rsa-sha2-256`                           | RSA >= 3072 bit, RSASSA-PKCS1-v1_5 + SHA-256 per RFC 8332 (NOT PSS) | keys < 3072 bit MUST be refused |
+| `rsa-sha2-512`                           | RSA >= 3072 bit, RSASSA-PKCS1-v1_5 + SHA-512 per RFC 8332 (NOT PSS) | keys < 3072 bit MUST be refused |
+| `sk-ssh-ed25519@openssh.com`             | FIDO2 Ed25519, OpenSSH PROTOCOL.u2f encoding    | see below                      |
+| `sk-ecdsa-sha2-nistp256@openssh.com`     | FIDO2 ECDSA P-256, OpenSSH PROTOCOL.u2f encoding| see below                      |
+
+Key/signature wire names reuse OpenSSH exactly for key-blob interop.
+All NEW fsh protocol names use `@fsh.dev`, never `@openssh.com`.
+
+`ssh-ed448` (RFC 8032): public-key blob is `string "ssh-ed448" ||
+string 57-byte public key` (Ed448 public key, RFC 8032 Section 5.2).
+Signature blob is `string "ssh-ed448" || string 114-byte signature`
+(Ed448 sign/verify, RFC 8032 Section 5.3, pure-EdDSA, no prehash).
+Servers MUST verify with RFC 8032 Ed448 verification and reject any
+non-114-byte signature or non-57-byte key.
+
+`sk-*` (OpenSSH PROTOCOL.u2f): key blob appends the FIDO/U2F
+application (`string`), flags (`byte`), key-handle (`string`), and
+reserved (`string`) fields to the base key encoding, using the
+canonical names `sk-ssh-ed25519@openssh.com` and
+`sk-ecdsa-sha2-nistp256@openssh.com` (never bare `sk-ssh-ed25519` or
+`sk-ecdsa-sha2-*`). The signature blob prefixes authenticator data:
+`string algorithm || string authenticator-data (flags || uint32-BE
+counter || extensions-output) || string signature`. The signature
+covers the same session-identifier-prefixed blob as other types, with
+the inner signature computed over (authenticator-data || signed blob)
+per PROTOCOL.u2f. Servers SHOULD check the user-verification (UV)
+flag against local policy.
 
 Rules:
-
 - RSA keys shorter than 3072 bits MUST be refused at parse time.
-- RSA signatures MUST use SHA-2 (PSS preferred, PKCS#1 v1.5 with
-  SHA-256/512 accepted). SHA-1 (`ssh-rsa`) is not a name in this
-  protocol.
-- `sk-*` blobs carry the authenticator data (flags, counter, UV
-  extension output) per the existing OpenSSH `sk-*` encoding; the
-  signature covers the same blob as other types. Servers SHOULD check
-  the user-verification (UV) flag against local policy.
+- RSA signatures MUST use RSASSA-PKCS1-v1_5 with SHA-256/ SHA-512
+  per RFC 8332. RSASSA-PSS MUST NOT be sent or accepted. SHA-1
+  (`ssh-rsa`) is not a name in this protocol.
 - Unknown key-type names: server MUST reply `FAILURE(51)`, never
   `PK_OK(60)`.
 
@@ -224,10 +247,15 @@ RFC 4252 defines `publickey`, `password`, `hostbased`,
 
 Consequences:
 
-- No `SSH_MSG_USERAUTH_PASSWD_CHANGEREQ(60)` equivalent. That number
-  (60) is reused for `PK_OK` in the method-specific block (60-79).
 - No partial success (`FAILURE` boolean always 0). Single method
   means authentication either succeeds fully or fails.
-- No banner message (`SSH_MSG_USERAUTH_BANNER`, RFC 4252 section
-  5.4): pre-auth text is a phishing aid; servers with a legal notice
-  SHOULD present it at connection-open or MOTD instead.
+- No banner: there is no `USERAUTH_BANNER` mechanism in fsh.
+  Message number 53 is unassigned and MUST NOT be sent. Servers
+  MUST NOT send any pre-auth or post-auth banner text as an auth
+  message.
+
+## 7. Extensibility / unknown handling
+
+Unknown message in assigned ranges (50-79) on the control stream ->
+reply `UNIMPLEMENTED`; unknown message in the 192-255 local range ->
+ignore.
