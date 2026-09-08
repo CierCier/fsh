@@ -30,7 +30,11 @@ there is no SSH-style version-string exchange.
 
 - ALPN: endpoints MUST offer and select `fsh/1`. A server that does
   not recognize the ALPN MUST abort the connection. No other ALPN
-  token is defined.
+  token is defined in v0. QUIC version negotiation does not negotiate
+  FSH semantics; it negotiates only the QUIC wire version (RFC 9000).
+  Future incompatible revisions of FSH MUST use distinct ALPN strings
+  (`fsh/2`, and so on). Compatible evolution within one ALPN uses
+  `@fsh.dev` extension names, never a new ALPN token.
 - TLS parameters: TLS 1.3 only. AEAD suites only:
   `tls-aes-128-gcm-sha256`, `tls-aes-256-gcm-sha384`,
   `tls-chacha20-poly1305-sha256` (TLS 1.3 cipher suites, lowercase-
@@ -76,10 +80,16 @@ Stream segments therefore have no message meaning; only the
 reassembled length-delimited unit is a message.
 
 The rule applies uniformly to the control stream and to every channel
-stream. Senders MUST emit exactly one length prefix per message;
-receivers MUST reject (treat as fatal decode error) a length that
-would exceed the remaining stream or a sane maximum (RECOMMENDED
-35000, matching SSH's 35000-byte packet ceiling in spirit).
+stream. Senders MUST emit exactly one length prefix per message.
+
+Maximum framed message size is 35000 bytes total (the u32-BE
+length-field value, i.e. 1 + len(payload)). Endpoints MUST NOT send a
+message larger than 35000 bytes. Receipt of an oversize message on the
+control stream REQUIRES the receiver to send `SSH_MSG_DISCONNECT`
+with reason code 1 (protocol-error) and then close the QUIC
+connection. Oversize channel-stream messages are a fatal decode
+error: the receiver MUST abort the channel stream and SHOULD treat a
+repeated or egregious violation as a connection protocol error.
 
 ## Streams
 
@@ -119,24 +129,45 @@ no separate host-key-blob identity and no cert-chain-vs-TOFU duality.
   Key Info (SPKI) of that certificate.
 - Trust-on-first-use (TOFU) on first connect with explicit user
   confirmation is the default policy; enterprise deployments MAY
-  pre-provision pins. The client maintains a persistent pin store —
-  the OpenSSH known-hosts equivalent — keyed by hostname, port, and
-  SPKI hash, and compares the presented SPKI against it on every
-  subsequent connect.
+  pre-provision pins. The client maintains a persistent pin store
+  keyed by hostname, port, and SPKI hash, and compares the presented
+  SPKI against it on every subsequent connect.
 - The server proves possession implicitly via the TLS handshake
   (RFC 8446): only the holder of the private key matching the pinned
   SPKI can complete the handshake. No separate host-key signature or
   out-of-handshake host-key assertion exists.
-- Fingerprint format: SHA-256 over the DER-encoded SPKI, base64-encoded
-  without padding, displayed as OpenSSH-style `SHA256:` fingerprints
-  so operators can compare out of band.
-- On pin mismatch the client MUST abort with `SSH_MSG_DISCONNECT`
-  and MUST NOT proceed to userauth. Rotation is a pin-store operation
-  (add the new SPKI pin, optionally retain the old during migration);
-  there is no in-protocol multi-key assertion.
 - Public-key algorithm names for SPKI keys reuse OpenSSH exactly
   (see authentication protocol); TLS internals (signatureScheme
   negotiation) remain a TLS 1.3 concern (RFC 8446).
+
+### SPKI validation details
+
+Pinning REPLACES PKIX validation. Self-signed server certificates are
+expected and MUST be accepted subject to the pin rules below.
+Endpoints MUST NOT enforce SNI/SAN matching, certificate expiry,
+or EKU constraints on the fsh server certificate; they MUST ignore
+those fields for authentication purposes (they MAY still log them
+for diagnostics).
+
+- Fingerprint: base64-encoded (without padding) SHA-256 over the
+  DER-encoded SPKI. Displayed with the distinct prefix `FSH-SHA256:`
+  followed by the base64 value (e.g.
+  `FSH-SHA256:AbCdEf...`). It MUST NOT be labelled `SHA256:` alone
+  and MUST NOT be confused with any other ecosystem's fingerprint format.
+- First contact: when no pin exists for the host/port, the client
+  MUST display the `FSH-SHA256:` fingerprint to the user and require
+  explicit user confirmation (SSH-style TOFU prompt: show
+  host, port, and fingerprint, and proceed only on affirmative
+  answer) before proceeding. On confirmation the client stores the
+  pin; on refusal it aborts the QUIC connection without sending
+  further fsh messages.
+- Pin mismatch: when a pin exists and the presented SPKI does not
+  match, the client MUST refuse the connection: it MUST send
+  `SSH_MSG_DISCONNECT` with reason code 3 (host-key-changed) where
+  possible and then close the QUIC connection, and MUST NOT proceed
+  to userauth. Rotation is a pin-store operation (add the new SPKI
+  pin, optionally retain the old during migration); there is no
+  in-protocol multi-key assertion.
 
 ## Channel binding
 
@@ -166,17 +197,130 @@ Transport owns 1-19 (generic) and 20-29 (negotiation). All other
 ranges belong to userauth (50-79), connection (80-127), reservation
 (128-191), and local extensions (192-255).
 
-Generic (control stream):
+All messages below travel on the control stream (QUIC stream 0) and
+are length-framed per the Framing section: `u32-BE length || u8
+msg-number || payload`. Field encodings follow RFC 4251 conventions:
+`uint32` is 4 octets big-endian, `string` is `uint32 length || bytes`
+(UTF-8 where text), `boolean` is a single octet (`0` = FALSE,
+nonzero = TRUE; senders MUST send `0` or `1`), `u8` is a single
+octet. There are no SSH sequence numbers anywhere in v0.
 
-| Number | Name                    | Notes                                  |
-|--------|-------------------------|----------------------------------------|
-| 1      | SSH_MSG_DISCONNECT      | Reason code + description; then close  |
-| 2      | SSH_MSG_IGNORE          | No-op; keepalive-safe                  |
-| 3      | SSH_MSG_UNIMPLEMENTED   | Reply to unknown msg-number            |
-| 4      | SSH_MSG_DEBUG           | `always-display` flag + text           |
-| 5      | SSH_MSG_SERVICE_REQUEST | Service name: `fsh-userauth`, `fsh-connection` |
-| 6      | SSH_MSG_SERVICE_ACCEPT  | Echo of accepted service name          |
-| 7-19   | reserved                | No message defined; see unknown rule   |
+### SSH_MSG_DISCONNECT (1)
+
+```
+u8 msg-number (= 1) || uint32 reason-code || string message
+```
+
+| Field       | Type   | Notes                                              |
+|-------------|--------|----------------------------------------------------|
+| msg-number  | u8     | Always 1                                           |
+| reason-code | uint32 | One of the codes below                             |
+| message     | string | UTF-8 human-readable explanation; no language tag  |
+
+Reason codes:
+
+| Code | Name             | Meaning                                |
+|------|------------------|----------------------------------------|
+| 1    | protocol-error   | Generic protocol violation / decode error, incl. oversize framed message |
+| 2    | auth-failed      | Authentication failed, no further attempts possible |
+| 3    | host-key-changed | Server SPKI pin mismatch               |
+| 4    | shutting-down    | Sender is closing down                 |
+| 5    | too-many-requests| Rate limit / request overload          |
+
+Behavior: a sender that transmits DISCONNECT MUST close the QUIC
+connection immediately after sending it (no further fsh messages on
+any stream). A receiver that gets DISCONNECT SHOULD log the
+reason-code and message, MUST NOT send further fsh messages except
+to flush already-queued transport state, and MUST treat the session
+as terminated once the QUIC connection closes. There is no
+language-tag field (unlike RFC 4253); receivers MUST parse exactly
+reason-code + message and reject trailing bytes as a decode error.
+
+### SSH_MSG_IGNORE (2)
+
+```
+u8 msg-number (= 2) || opaque bytes (any length, including zero)
+```
+
+| Field      | Type    | Notes                                    |
+|------------|---------|------------------------------------------|
+| msg-number | u8      | Always 2                                 |
+| data       | opaque  | Zero or more arbitrary bytes; no structure |
+
+Behavior: the receiver MUST ignore the entire message (all payload
+bytes after the msg-number) and MUST NOT send any reply in response
+to IGNORE — never UNIMPLEMENTED, DEBUG, or any other message. Either
+side MAY send IGNORE as an application-level keepalive; it carries
+no semantics.
+
+### SSH_MSG_UNIMPLEMENTED (3)
+
+```
+u8 msg-number (= 3) || u8 offending-msg-number
+```
+
+| Field                | Type | Notes                                        |
+|----------------------|------|----------------------------------------------|
+| msg-number           | u8   | Always 3                                     |
+| offending-msg-number | u8   | The msg-number that was not understood       |
+
+The payload is the single offending message number — the msg-number
+the sender did not understand or cannot process. There are no
+sequence numbers in fsh, so unlike RFC 4253 there is no rejected
+sequence-number field. Behavior: sent only on the control stream in
+reply to an unknown or unsupported message received on the control
+stream (see unknown-handling rule below). It MUST NOT be sent in
+reply to IGNORE, DISCONNECT, or itself; a receiver MUST NOT reply
+to UNIMPLEMENTED with UNIMPLEMENTED. Receipt of UNIMPLEMENTED is
+advisory (log / diagnosed); it does not close the connection by
+itself.
+
+### SSH_MSG_DEBUG (4)
+
+```
+u8 msg-number (= 4) || boolean always-display || string message
+```
+
+| Field          | Type    | Notes                                              |
+|----------------|---------|----------------------------------------------------|
+| msg-number     | u8      | Always 4                                           |
+| always-display | boolean | TRUE = display even when debugging is off          |
+| message        | string  | UTF-8 debug text; no language tag                  |
+
+Behavior: purely informational; the receiver MUST NOT reply to
+DEBUG. If `always-display` is TRUE the implementation SHOULD display
+the text to the user; otherwise it SHOULD display it only when
+debugging is enabled. There is no language-tag field.
+
+### SSH_MSG_SERVICE_REQUEST (5) / SSH_MSG_SERVICE_ACCEPT (6)
+
+```
+u8 msg-number (= 5 or 6) || string service-name
+```
+
+| Field        | Type   | Notes                                |
+|--------------|--------|--------------------------------------|
+| msg-number   | u8     | 5 = REQUEST, 6 = ACCEPT              |
+| service-name | string | UTF-8 service name (listed below)    |
+
+Defined services: `fsh-userauth`, `fsh-connection`. No other service
+name is defined in v0.
+
+Behavior: after the QUIC/TLS handshake the client sends
+`SSH_MSG_SERVICE_REQUEST` with `fsh-userauth`; the server replies
+`SSH_MSG_SERVICE_ACCEPT` echoing the accepted service name. A server
+that does not accept the requested service MUST reply with
+`SSH_MSG_DISCONNECT` (reason 1, protocol-error) and close the
+connection — there is no failure reply distinct from DISCONNECT.
+`fsh-connection` runs only after userauth success: the client sends
+a second SERVICE_REQUEST for `fsh-connection` and the server echoes
+SERVICE_ACCEPT. An ACCEPT with a service name the client did not
+request is a protocol error (treat as DISCONNECT protocol-error).
+
+### Reserved and unknown messages
+
+7-19: reserved. No message is defined in this range; endpoints MUST
+NOT send them.
 
 Negotiation (20-29): reserved for future transport extensions.
 Currently no message in this range is defined; endpoints MUST NOT
@@ -185,14 +329,18 @@ send them. There is no `KEXINIT` (20), `NEWKEYS` (21), `KEXDH_*`
 numbers MUST NOT be reused, and 7-19 stay reserved.
 
 Unknown-message handling — one rule: an unknown message in assigned
-ranges received on the control stream MUST elicit
-`SSH_MSG_UNIMPLEMENTED`; an unknown message in the 192-255 local
-range MUST be ignored.
+ranges (including the reserved ranges 7-29 and any other assigned
+but unimplemented number) received on the control stream MUST elicit
+`SSH_MSG_UNIMPLEMENTED` carrying the offending msg-number; an
+unknown message in the 192-255 local range MUST be ignored (never
+elicits a reply). Reserved ranges therefore receive exactly like
+unknown messages: UNIMPLEMENTED on the control stream.
 
-Service setup: after the QUIC/TLS handshake the client sends
-`SSH_MSG_SERVICE_REQUEST` with `fsh-userauth`; the server replies
-`SSH_MSG_SERVICE_ACCEPT`. `fsh-connection` runs only after userauth
-success.
+Registry baseline: v0 `@fsh.dev` extension names recorded in the
+registry (including `keepalive@fsh.dev`) are baseline-known to every
+v0 implementation and need no advertisement. Future `@`-suffixed
+extension names need an advertisement mechanism; that mechanism is
+TBD and explicitly out of scope for v0.
 
 ## Security properties
 

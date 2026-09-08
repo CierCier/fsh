@@ -256,3 +256,9 @@ conformance message vectors, fuzzing harnesses, a second independent
 implementation, benchmarks against OpenSSH / Mosh / SSH3 over lossy
 and high-latency links, and license / security-policy / governance
 documents.
+
+## 8. Next gate
+
+Next gate: v0 now defines the exact control-stream grammar and the
+channel state machine (see the transport and connection
+specifications); implementation may begin against them.

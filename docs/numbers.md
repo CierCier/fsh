@@ -31,9 +31,11 @@ framing shape even where fsh defines no message in them.
 `—` means the number is retained but has no fsh message.
 
 Unknown handling (applies everywhere): an endpoint that receives an
-unknown message whose number lies in an assigned range on the control
+unknown message whose number lies in 1-191 on the control
 stream MUST reply with UNIMPLEMENTED (3); an endpoint that receives an
 unknown message whose number lies in 192-255 MUST ignore it.
+Reserved 128-191 receives like unknown: receipt on the control stream
+MUST elicit UNIMPLEMENTED (3), never a connection error.
 
 Transport, generic (1-19):
 
@@ -41,7 +43,7 @@ Transport, generic (1-19):
 |--------|---------------|--------------------------------|
 | 1      | DISCONNECT    | error text + reason code       |
 | 2      | IGNORE        | keepalive / traffic shaping    |
-| 3      | UNIMPLEMENTED | response to unknown sequence   |
+| 3      | UNIMPLEMENTED | reply to unknown message; carries offending message number |
 | 4      | DEBUG         | human-readable only            |
 | 5      | SERVICE_REQUEST | request `fsh-userauth` / `fsh-connection` |
 | 6      | SERVICE_ACCEPT  | accept a requested service     |
@@ -94,7 +96,13 @@ Global request names:
 
 | Name | Notes |
 |------|-------|
-| `keepalive@fsh.dev` | keepalive; both sides SHOULD accept and reply REQUEST_SUCCESS with no payload |
+| `keepalive@fsh.dev` | keepalive; baseline-known in v0, needs no advertisement; both sides MUST accept and reply REQUEST_SUCCESS with no payload |
+
+Baseline rule: every `@fsh.dev` name listed in this v0 registry
+(`keepalive@fsh.dev`) is baseline-known and MUST be accepted without
+any advertisement exchange. Any future `@` name not listed here needs
+an advertisement mechanism; that mechanism is TBD and explicitly out
+of v0. There is no EXT_INFO advertisement in v0.
 
 Connection, channel (90-127):
 
@@ -132,7 +140,7 @@ interop (see naming exception below):
 | Name | Key type | Notes |
 |------|----------|-------|
 | `ssh-ed25519` | Ed25519 | RECOMMENDED; EdDSA per RFC 8032 |
-| `ssh-ed448` | Ed448 | OPTIONAL to implement; when implemented, EdDSA per RFC 8032 exactly as specified in authentication.md; endpoints without it MUST refuse the algorithm, never negotiate down |
+| `ssh-ed448` | Ed448 | implement or refuse; when implemented, EdDSA per RFC 8032 exactly as specified in authentication.md; endpoints without it MUST refuse the algorithm, never negotiate down |
 | `ecdsa-sha2-nistp256` | ECDSA P-256 | as in OpenSSH / RFC 5656 profile |
 | `ecdsa-sha2-nistp384` | ECDSA P-384 | as in OpenSSH / RFC 5656 profile |
 | `ecdsa-sha2-nistp521` | ECDSA P-521 | as in OpenSSH / RFC 5656 profile |
@@ -161,6 +169,10 @@ Requested via SERVICE_REQUEST (5) / accepted via SERVICE_ACCEPT
 `fsh-connection` is requested.
 
 ## Naming rules
+
+ALPN revision note (full rule in transport.md): the v0 ALPN is
+`fsh/1`; future incompatible revisions MUST use distinct ALPN strings
+(`fsh/2`, ...), while compatible evolution uses `@fsh.dev` names.
 
 Applies to algorithm, service, channel-type, request, subsystem,
 and extension names:
@@ -200,15 +212,21 @@ STANDARDS-ACTION-style discipline, adapted for a single-repo spec:
   redefined. Deprecated items are marked HISTORIC, never removed
   from the tables.
 - 128-191 stays reserved until a protocol revision assigns it;
-  implementations MUST NOT send on it.
+  implementations MUST NOT send on it. Receipt on the control stream
+  behaves like unknown: MUST reply UNIMPLEMENTED (3), never a
+  connection error.
 - Unknown handling (same rule as above): an endpoint that receives
-  an unknown message whose number lies in an assigned range on the
-  control stream MUST reply with UNIMPLEMENTED (3); an endpoint that
+  an unknown message whose number lies in 1-191 on the control
+  stream MUST reply with UNIMPLEMENTED (3); an endpoint that
   receives an unknown message whose number lies in 192-255 MUST
   ignore it.
-- 192-255 and any `name@FQDN` need no central approval but MUST
-  NOT collide with assigned numbers or standard names, and MUST
-  NOT be sent unless the peer advertised support by explicit
+- Baseline `@fsh.dev` names listed in this v0 registry
+  (`keepalive@fsh.dev`) need no advertisement and MUST be accepted.
+  Future `@` names not listed here need an advertisement mechanism;
+  that mechanism is TBD and explicitly out of v0.
+- 192-255 and any non-baseline `name@FQDN` need no central approval
+  but MUST NOT collide with assigned numbers or standard names, and
+  MUST NOT be sent unless the peer advertised support by explicit
   configuration. There is no EXT_INFO advertisement in v0.
 - All five protocol docs MUST use the block and naming rules in
   this document; on conflict, this document wins for numbers

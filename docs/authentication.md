@@ -61,10 +61,16 @@ Flow:
    `fsh-connection`) or `FAILURE(51)` (attempt rejected, may retry).
 3. `FAILURE` continuations list contains exactly `"publickey"`.
    Clients MUST NOT interpret any other name; servers MUST NOT send
-   any other name. This name-list is the sole pubkey-algorithm
-   advertisement: there is no separate advertisement message, no
-   `EXT_INFO` (7-19 stay reserved), and no extension negotiation for
-   algorithms.
+   any other name. This name-list advertises authentication methods
+   only and MUST NOT be interpreted as advertising public-key
+   algorithms. There is no algorithm advertisement in fsh: the probe
+   (`PK_OK`) / direct-sign-then-`FAILURE` exchange in section 3 IS the
+   complete negotiation mechanism. A client learns whether an
+   (algorithm, key) pair is acceptable by sending a probe and observing
+   `PK_OK` vs `FAILURE`, or by sending a signed request directly and
+   observing `SUCCESS` vs `FAILURE`. There is no separate
+   advertisement message, no `EXT_INFO` (7-19 stay reserved), and no
+   extension negotiation for algorithms.
 4. Unrecognized methods: server MUST reply `FAILURE(51)` with
    `["publickey"]`. There is no fallback negotiation.
 5. Servers SHOULD rate-limit and cap consecutive failures (RECOMMENDED:
@@ -146,13 +152,25 @@ string    public-key blob
 | `ecdsa-sha2-nistp256`                    | ECDSA P-256 + SHA-256                           |                                |
 | `ecdsa-sha2-nistp384`                    | ECDSA P-384 + SHA-384                           |                                |
 | `ecdsa-sha2-nistp521`                    | ECDSA P-521 + SHA-512                           |                                |
-| `rsa-sha2-256`                           | RSA >= 3072 bit, RSASSA-PKCS1-v1_5 + SHA-256 per RFC 8332 (NOT PSS) | keys < 3072 bit MUST be refused |
-| `rsa-sha2-512`                           | RSA >= 3072 bit, RSASSA-PKCS1-v1_5 + SHA-512 per RFC 8332 (NOT PSS) | keys < 3072 bit MUST be refused |
+| `rsa-sha2-256`                           | RSA >= 3072 bit signature algorithm, RSASSA-PKCS1-v1_5 + SHA-256 per RFC 8332 (NOT PSS) | public-key blob uses `ssh-rsa` format (see below); keys < 3072 bit MUST be refused |
+| `rsa-sha2-512`                           | RSA >= 3072 bit signature algorithm, RSASSA-PKCS1-v1_5 + SHA-512 per RFC 8332 (NOT PSS) | public-key blob uses `ssh-rsa` format (see below); keys < 3072 bit MUST be refused |
+| `ssh-rsa` (blob only)                    | RSA public-key blob format: `string "ssh-rsa" \|\| mpint e \|\| mpint n` | MUST be accepted as key material; MUST NOT be accepted as a signature algorithm name |
 | `sk-ssh-ed25519@openssh.com`             | FIDO2 Ed25519, OpenSSH PROTOCOL.u2f encoding    | see below                      |
 | `sk-ecdsa-sha2-nistp256@openssh.com`     | FIDO2 ECDSA P-256, OpenSSH PROTOCOL.u2f encoding| see below                      |
 
 Key/signature wire names reuse OpenSSH exactly for key-blob interop.
 All NEW fsh protocol names use `@fsh.dev`, never `@openssh.com`.
+
+RSA blob vs signature (RFC 8332): the RSA public-key blob format is
+`string "ssh-rsa" || mpint e || mpint n` and MUST be accepted as key
+material for `rsa-sha2-256` / `rsa-sha2-512` keys. The algorithm name
+field in the probe and signed request for RSA keys MUST be
+`rsa-sha2-256` or `rsa-sha2-512`. The signature algorithm name
+`ssh-rsa` (RSA + SHA-1) MUST NOT be sent and MUST be refused: a server
+receiving algorithm name `ssh-rsa` in a probe or signed request MUST
+reply `FAILURE(51)` without verifying. RSA signatures MUST use
+RSASSA-PKCS1-v1_5 with SHA-256 / SHA-512 per RFC 8332.
+RSASSA-PSS MUST NOT be sent or accepted.
 
 `ssh-ed448` (RFC 8032): public-key blob is `string "ssh-ed448" ||
 string 57-byte public key` (Ed448 public key, RFC 8032 Section 5.2).
@@ -161,24 +179,80 @@ Signature blob is `string "ssh-ed448" || string 114-byte signature`
 Servers MUST verify with RFC 8032 Ed448 verification and reject any
 non-114-byte signature or non-57-byte key.
 
-`sk-*` (OpenSSH PROTOCOL.u2f): key blob appends the FIDO/U2F
-application (`string`), flags (`byte`), key-handle (`string`), and
-reserved (`string`) fields to the base key encoding, using the
-canonical names `sk-ssh-ed25519@openssh.com` and
+`sk-*` (OpenSSH PROTOCOL.u2f, reproduced normatively): the
+OpenSSH interoperability claim in this section holds ONLY for the exact
+wire encodings below, quoted from OpenSSH PROTOCOL.u2f. The canonical
+names are `sk-ssh-ed25519@openssh.com` and
 `sk-ecdsa-sha2-nistp256@openssh.com` (never bare `sk-ssh-ed25519` or
-`sk-ecdsa-sha2-*`). The signature blob prefixes authenticator data:
-`string algorithm || string authenticator-data (flags || uint32-BE
-counter || extensions-output) || string signature`. The signature
-covers the same session-identifier-prefixed blob as other types, with
-the inner signature computed over (authenticator-data || signed blob)
-per PROTOCOL.u2f. Servers SHOULD check the user-verification (UV)
-flag against local policy.
+`sk-ecdsa-sha2-*`).
+
+The format of a `sk-ecdsa-sha2-nistp256@openssh.com` public key is:
+
+```
+string		"sk-ecdsa-sha2-nistp256@openssh.com"
+string		curve name
+ec_point	Q
+string		application (user-specified, but typically "ssh:")
+```
+
+The format of a `sk-ssh-ed25519@openssh.com` public key is:
+
+```
+string		"sk-ssh-ed25519@openssh.com"
+string		public key
+string		application (user-specified, but typically "ssh:")
+```
+
+The corresponding private halves additionally contain `uint8 flags`,
+`string key_handle`, and `string reserved`; these are local key-store
+fields and are never sent as part of the public-key blob in the probe
+or signed request.
+
+The U2F signature operation signs a blob consisting of:
+
+```
+byte[32]	SHA256(application)
+byte		flags (including "user present", extensions present)
+uint32		counter
+byte[]		extensions
+byte[32]	SHA256(message)
+```
+
+No extensions are defined for SSH use. In fsh, `message` is the
+session-identifier-prefixed signed blob defined in section 3.2, and
+`application` is the application string from the public-key blob.
+
+The signature format used on the wire in the signed request is, for
+ECDSA:
+
+```
+string		"sk-ecdsa-sha2-nistp256@openssh.com"
+string		ecdsa_signature
+byte		flags
+uint32		counter
+```
+
+where the `ecdsa_signature` field follows the RFC 5656 ECDSA signature
+encoding (`mpint r || mpint s`). This encoding avoids server-side ASN.1
+parsing of the X9.62 hardware format in the pre-authentication attack
+surface. For Ed25519 keys the wire signature is encoded as:
+
+```
+string		"sk-ssh-ed25519@openssh.com"
+string		signature
+byte		flags
+uint32		counter
+```
+
+Servers SHOULD check the user-presence / user-verification flags
+against local policy. Certificate forms
+(`sk-ecdsa-sha2-nistp256-cert-v01@openssh.com`,
+`sk-ssh-ed25519-cert-v01@openssh.com`) and
+`webauthn-sk-ecdsa-sha2-nistp256@openssh.com` signatures are NOT part
+of fsh v0 and MUST be refused as unknown key-type names.
 
 Rules:
 - RSA keys shorter than 3072 bits MUST be refused at parse time.
-- RSA signatures MUST use RSASSA-PKCS1-v1_5 with SHA-256/ SHA-512
-  per RFC 8332. RSASSA-PSS MUST NOT be sent or accepted. SHA-1
-  (`ssh-rsa`) is not a name in this protocol.
 - Unknown key-type names: server MUST reply `FAILURE(51)`, never
   `PK_OK(60)`.
 
@@ -188,7 +262,7 @@ The following are NOT key types or methods in fsh and MUST NOT be
 implemented:
 
 - `ssh-dss` (DSA): insecure key size; removed.
-- `ssh-rsa` (RSA + SHA-1): broken hash; use `rsa-sha2-*`.
+- `ssh-rsa` as a signature algorithm (RSA + SHA-1): broken hash; use `rsa-sha2-256` / `rsa-sha2-512`. The `ssh-rsa` public-key blob format itself MUST still be accepted as key material (see section 4.1).
 - RSA keys < 3072 bit, regardless of hash.
 - `ssh-rsa-cert-v01`, `ssh-ed25519-cert-v01` (OpenSSH certificates):
   no cert-based user auth in this revision (host identity is handled
@@ -203,8 +277,10 @@ On each signed `USERAUTH_REQUEST(50)` the server MUST, in order:
 
 1. Reject malformed packets (bad lengths, trailing bytes, empty user,
    unknown/unsupported algorithm name) with `FAILURE(51)`.
-2. Reject excluded key material (DSA, `ssh-rsa`, RSA < 3072 bit) with
-   `FAILURE(51)`, without signature verification.
+2. Reject excluded key material (DSA, `ssh-rsa` signature algorithm,
+   RSA < 3072 bit) with `FAILURE(51)`, without signature verification.
+   The `ssh-rsa` public-key blob format is key material, not excluded:
+   it MUST be accepted for `rsa-sha2-256` / `rsa-sha2-512` keys.
 3. Look up the user; unknown users get `FAILURE(51)`. Implementations
    SHOULD take constant time to this point where practical (do not
    leak user existence via timing beyond what the probe already
@@ -242,7 +318,7 @@ RFC 4252 defines `publickey`, `password`, `hostbased`,
 | `keyboard-interactive` | Password/OTP prompting over the auth channel; same secrets problem, plus interactive downgrade surface. |
 | `hostbased`         | Trusts client host keys for user auth; fragile delegation, confusing semantics. |
 | `none`              | Grants access without proof; only ever useful for probing, which `FAILURE` continuations already handle. |
-| `ssh-rsa` / DSA / short RSA | Legacy crypto; TLS 1.3 transport is modern-only, auth matches it. |
+| `ssh-rsa` signatures / DSA / short RSA | Legacy crypto; TLS 1.3 transport is modern-only, auth matches it. `ssh-rsa` (SHA-1) signatures are refused; the `ssh-rsa` public-key blob format is still accepted as key material for `rsa-sha2-*`. |
 | `tcpip-forward`, `direct-tcpip`, `x11`, compression | Not auth-layer, but excluded protocol-wide: forwarding/compression belong to other layers or not at all. No auth method may request them. |
 
 Consequences:

@@ -67,6 +67,35 @@ Open procedure:
 
 Channel ids MUST NOT be reused within a connection.
 
+### 3.1 Channel-open race safety
+
+QUIC streams and control-stream messages race: a channel stream can
+arrive before its `CHANNEL_OPEN`. The following rules close every
+data-loss and mismatch path:
+
+- The client MUST NOT send channel-stream data or FIN on a channel
+  stream before it receives `CHANNEL_OPEN_CONFIRM` for that channel
+  id. Until confirmation, only `CHANNEL_OPEN` on the control stream
+  is valid for that channel.
+- Bytes arriving on a channel stream before the server has processed
+  the corresponding `CHANNEL_OPEN` MUST be discarded by the server.
+  The server MUST NOT buffer them for later delivery nor treat them
+  as data for any other channel.
+- FIN arriving before the corresponding `CHANNEL_OPEN` means the
+  channel never existed: the server discards all stream state for
+  that stream and takes no further channel action (no confirm, no
+  failure, no data delivery).
+- Rejected channels leave an orphan stream: when the server refuses
+  a channel it sends `CHANNEL_OPEN_FAILURE` on the control stream
+  and issues `RESET_STREAM` on the orphan channel stream. The client
+  MUST discard the stream on receipt of `CHANNEL_OPEN_FAILURE` and
+  MUST NOT send further data on it.
+- Pre-authentication quarantine: the client MUST NOT open non-zero
+  streams before authentication succeeds. The server MUST issue
+  `RESET_STREAM` on any non-zero stream opened before authentication
+  completes, without creating channel state or sending control
+  replies for it.
+
 ## 4. Data transfer (channel stream, framed)
 
 `CHANNEL_DATA` (94) and `CHANNEL_EXTENDED_DATA` (95) travel on the
@@ -91,30 +120,47 @@ disambiguates the standard stream:
   single DATA frame carries bytes for exactly one of them. Stream
   segments MUST NOT be interpreted as message boundaries.
 
-## 5. Shutdown reconciliation
+## 5. Shutdown reconciliation (drain rule)
 
 Sender half-close (QUIC FIN) on a channel stream means EOF for that
 direction. `CHANNEL_EOF` (96) is sent on the control stream, then FIN
 follows on the indicated data direction. `CHANNEL_CLOSE` (97) goes on
-the control stream. After both sides have sent `CHANNEL_CLOSE`, each
-endpoint issues `RESET_STREAM` / `STOP_SENDING` (RFC 9000) on any
-residual direction and discards all channel state; no further messages
-for that channel are valid.
+the control stream. The drain rule below forbids CLOSE-before-final-data
+truncation: no side closes until all peer data has been seen and
+delivered.
+
+Drain rule (normative):
+
+- A side MUST send FIN on its own data direction(s) before sending
+  `CHANNEL_CLOSE` for that channel.
+- A side MUST NOT send `CHANNEL_CLOSE` until it has observed FIN on
+  every peer data direction of the channel AND has delivered every
+  received DATA frame on that channel to the application.
+- A side MUST NOT issue `RESET_STREAM` while undelivered DATA frames
+  for that channel exist; reset is permitted only after both sides
+  have sent `CHANNEL_CLOSE` and all delivered state is drained (see
+  table), or for orphan / pre-auth streams per Section 3.1.
+- After both sides have sent `CHANNEL_CLOSE`, each endpoint issues
+  `RESET_STREAM` / `STOP_SENDING` (RFC 9000) on any residual
+  direction and discards all channel state; no further messages for
+  that channel are valid.
 
 | Event | Who sends | On which stream | Meaning / required action |
 |-------|-----------|-----------------|---------------------------|
 | Client stdin end | client | control: `CHANNEL_EOF(channel-id)`; then FIN on client -> server direction of the channel stream | no more stdin; server MAY keep stdout/stderr open |
 | Server stdout/stderr end | server | control: `CHANNEL_EOF(channel-id)`; then FIN on server -> client direction of the channel stream | no more output; preceded by exactly one of `exit-status` / `exit-signal` |
 | QUIC FIN received | transport | channel stream direction | EOF for that direction only; equivalent to having received `CHANNEL_EOF` if the control message was lost; MUST NOT be treated as full close |
-| `CHANNEL_CLOSE` | either side | control stream | "I am done with this channel"; sender MUST NOT send further messages for the channel except its own duplicate CLOSE handling |
+| `CHANNEL_CLOSE` | either side | control stream | "I am done with this channel"; permitted only after the drain rule is satisfied (own FIN sent, peer FIN observed on all data directions, all frames delivered); sender MUST NOT send further messages for the channel except its own duplicate CLOSE handling |
 | Both sides sent `CHANNEL_CLOSE` | both | control stream (each direction) | channel is dead; each endpoint MUST `RESET_STREAM` / `STOP_SENDING` any residual open direction, then discard state |
-| Half-open leftover (FIN without EOF, or EOF without FIN) | receiver | — | receiver MUST tolerate either order; a FIN without a preceding `CHANNEL_EOF` is still EOF; an EOF without a following FIN MUST be followed by connection-idle cleanup via `CHANNEL_CLOSE` |
+| Half-open leftover (FIN without EOF, or EOF without FIN) | receiver | — | receiver MUST tolerate either order; a FIN without a preceding `CHANNEL_EOF` is still EOF; an EOF without a following FIN MUST be followed by connection-idle cleanup via `CHANNEL_CLOSE` once the drain rule permits it |
 
 Normal termination order (server side): `exit-status` or `exit-signal`
 (98, `want-reply=false`), then `CHANNEL_EOF`, then FIN on the
-server -> client direction, then `CHANNEL_CLOSE`. Client closes its
-send direction when stdin ends, and sends `CHANNEL_CLOSE` after reading
-EOF and the exit notification.
+server -> client direction, then `CHANNEL_CLOSE` (only after the
+client FIN on stdin has been observed and all stdin frames delivered).
+Client closes its send direction when stdin ends, and sends
+`CHANNEL_CLOSE` after reading EOF and the exit notification and after
+its own FIN preconditions are met.
 
 ## 6. Channel requests
 
@@ -123,6 +169,20 @@ Request framing on the control stream: 98 (`CHANNEL_REQUEST`:
 data`), 99 (`CHANNEL_SUCCESS`: `uint32 channel-id`), 100
 (`CHANNEL_FAILURE`: `uint32 channel-id`). `want-reply` follows SSH
 semantics; exit and signal notifications use `want-reply = false`.
+`CHANNEL_SUCCESS` / `CHANNEL_FAILURE` carry the channel id and are
+matched to outstanding requests by FIFO order on that channel (see
+correlation below).
+
+Channel-request correlation (FIFO per channel): channel requests with
+`want-reply=true` on one channel are FIFO with at most 16 outstanding
+requests per channel. A sender MUST NOT have more than 16 unanswered
+`want-reply=true` channel requests outstanding on a single channel.
+The receiver MUST send replies (`CHANNEL_SUCCESS` / `CHANNEL_FAILURE`)
+in request order, one reply per `want-reply=true` request, and MUST NOT
+reorder them. Replies carry the channel id and are matched by order:
+the Nth reply answers the Nth outstanding request on that channel.
+Global requests follow a separate stop-and-wait rule (Section 8); the
+two correlation domains are independent.
 
 A `session` channel carries at most one program binding (`shell`,
 `exec`, or `subsystem`). A second binding request on the same channel
@@ -191,6 +251,13 @@ Framing on the control stream: 80 (`GLOBAL_REQUEST`:
   All other global requests MUST fail with `REQUEST_FAILURE`. No
   forwarding or listener requests exist in v0.
 
+Global-request correlation (stop-and-wait): global requests with
+`want-reply=true` are stop-and-wait with at most 1 outstanding request
+per connection. A sender MUST NOT send the next global request with
+`want-reply=true` until the reply (`REQUEST_SUCCESS` / `REQUEST_FAILURE`)
+to the previous one has arrived. Channel requests follow a separate
+FIFO rule (Section 6); the two correlation domains are independent.
+
 ## 9. Unknown-message handling
 
 An unknown message number in an assigned range received on the control
@@ -207,3 +274,16 @@ reserved and never sent.
 
 Numbers used here match the shared registry: 80-82 global, 90-97
 channel lifecycle, 98-100 channel requests (93 reserved, never sent).
+
+## 11. Request correlation summary
+
+- Global requests: stop-and-wait, at most 1 outstanding
+  `want-reply=true` global request per connection; the sender MUST NOT
+  send the next one until the `REQUEST_SUCCESS` / `REQUEST_FAILURE`
+  reply to the previous one arrives.
+- Channel requests: FIFO per channel, at most 16 outstanding
+  `want-reply=true` requests per channel; the receiver sends
+  `CHANNEL_SUCCESS` / `CHANNEL_FAILURE` (each carrying the channel id)
+  in request order, matched by order.
+- The two domains are independent: an outstanding global request never
+  blocks channel requests and vice versa.

@@ -1,6 +1,15 @@
 # fsh docs
 
-QUIC-based SSH alternative. Secure and blazingly fast.
+Experimental, capability-minimal QUIC-native remote-execution protocol for fleets and edge nodes.
+
+## Status
+
+Experimental: the v0 protocol design is still being specified, and the
+binaries in this repository (`bin/fsh`, `bin/fshd`, `bin/fcp`) are
+placeholders, not working implementations. There are no conformance
+tests yet. See the five protocol documents below for the current
+design: `docs/architecture.md`, `docs/transport.md`,
+`docs/authentication.md`, `docs/connection.md`, and `docs/numbers.md`.
 
 ## Layout
 
