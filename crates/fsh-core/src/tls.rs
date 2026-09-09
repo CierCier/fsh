@@ -421,10 +421,59 @@ fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     if bytes.starts_with(b"-----BEGIN") {
         read_private_key_pem(&bytes)
     } else {
-        // Raw DER keys are assumed to be PKCS#8, matching the previous
-        // behavior for `openssl genpkey` and rcgen output.
-        Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes)))
+        Ok(classify_der_private_key(&bytes))
     }
+}
+
+/// Read one DER TLV header, returning `(tag, header_len, content_len)`.
+fn der_header(bytes: &[u8], offset: usize) -> Option<(u8, usize, usize)> {
+    let tag = *bytes.get(offset)?;
+    let first = *bytes.get(offset + 1)?;
+    let (header_len, content_len) = if first & 0x80 == 0 {
+        (2usize, first as usize)
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let mut length = 0usize;
+        for index in 0..count {
+            length = (length << 8) | *bytes.get(offset + 2 + index)? as usize;
+        }
+        (2 + count, length)
+    };
+    Some((tag, header_len, content_len))
+}
+
+/// A bare DER private key carries no format label, so sniff the structure.
+/// All three formats (RFC 5208 PKCS#8, RFC 8017 PKCS#1, RFC 5915 SEC1) open
+/// with `SEQUENCE(version)`; PKCS#8 continues with an AlgorithmIdentifier
+/// `SEQUENCE`, PKCS#1 with the modulus `INTEGER` (version 1 for multi-prime
+/// keys), and SEC1 uses version 1 followed by an `OCTET STRING`. Anything
+/// else falls back to PKCS#8, which is what rustls validates.
+fn classify_der_private_key(bytes: &[u8]) -> PrivateKeyDer<'static> {
+    let pkcs8 = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes.to_vec()));
+    let classified = (|| {
+        let (outer_tag, version_offset, outer_len) = der_header(bytes, 0)?;
+        if outer_tag != 0x30 || bytes.len() < version_offset + outer_len {
+            return None;
+        }
+        let (version_tag, version_header, version_len) = der_header(bytes, version_offset)?;
+        if version_tag != 0x02 || version_len != 1 {
+            return None;
+        }
+        let version = *bytes.get(version_offset + version_header)?;
+        let (next_tag, ..) = der_header(bytes, version_offset + version_header + version_len)?;
+        Some(match (version, next_tag) {
+            (0x00, 0x30) => pkcs8(),
+            (0x00, 0x02) | (0x01, 0x02) => {
+                PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(bytes.to_vec()))
+            }
+            (0x01, 0x04) => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(bytes.to_vec())),
+            _ => pkcs8(),
+        })
+    })();
+    classified.unwrap_or_else(pkcs8)
 }
 
 fn read_private_key_pem(bytes: &[u8]) -> Result<PrivateKeyDer<'static>> {
@@ -578,5 +627,53 @@ mod tests {
         write_pem(&unknown, "SOMETHING ELSE", &[1, 2, 3]);
         assert!(read_private_key(&unknown).is_err());
         let _ = fs::remove_file(&unknown);
+    }
+
+    #[test]
+    fn bare_der_keys_are_classified_by_structure() {
+        // SEQUENCE(version=0, AlgorithmIdentifier SEQUENCE) → PKCS#8.
+        let pkcs8 = vec![0x30, 0x07, 0x02, 0x01, 0x00, 0x30, 0x02, 0x05, 0x00];
+        assert!(matches!(
+            classify_der_private_key(&pkcs8),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+
+        // SEQUENCE(version=0, modulus INTEGER) → PKCS#1.
+        let pkcs1 = vec![
+            0x30, 0x09, 0x02, 0x01, 0x00, 0x02, 0x04, 0x01, 0x02, 0x03, 0x04,
+        ];
+        assert!(matches!(
+            classify_der_private_key(&pkcs1),
+            PrivateKeyDer::Pkcs1(_)
+        ));
+
+        // SEQUENCE(version=1, OCTET STRING) → SEC1.
+        let sec1 = vec![0x30, 0x07, 0x02, 0x01, 0x01, 0x04, 0x02, 0xAA, 0xBB];
+        assert!(matches!(
+            classify_der_private_key(&sec1),
+            PrivateKeyDer::Sec1(_)
+        ));
+
+        // SEQUENCE(version=1, modulus INTEGER) → multi-prime PKCS#1.
+        let multi_prime = vec![
+            0x30, 0x09, 0x02, 0x01, 0x01, 0x02, 0x04, 0x01, 0x02, 0x03, 0x04,
+        ];
+        assert!(matches!(
+            classify_der_private_key(&multi_prime),
+            PrivateKeyDer::Pkcs1(_)
+        ));
+
+        // Long-form lengths and unparseable input fall back to PKCS#8.
+        let long_form = vec![
+            0x30, 0x82, 0x00, 0x07, 0x02, 0x01, 0x00, 0x30, 0x02, 0x05, 0x00,
+        ];
+        assert!(matches!(
+            classify_der_private_key(&long_form),
+            PrivateKeyDer::Pkcs8(_)
+        ));
+        assert!(matches!(
+            classify_der_private_key(b"\x30\x02\x02\x01"),
+            PrivateKeyDer::Pkcs8(_)
+        ));
     }
 }
