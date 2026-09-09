@@ -3560,6 +3560,55 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
 
+    /// Resolve a helper binary for `Exec` tests to an absolute path.
+    ///
+    /// The daemon spawns `Exec` words without a login-shell `PATH` search,
+    /// and the `PATH` it hands to `sh -c` wrappers only covers FHS
+    /// directories, so tests must pass absolute tool paths to stay hermetic
+    /// on machines without FHS coreutils (e.g. NixOS, which has no
+    /// `/bin/cat` or `/usr/bin/sleep`). The test process's own `PATH` wins;
+    /// the classic FHS directories are fallbacks.
+    fn test_tool(name: &str) -> String {
+        let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        dirs.extend(["/bin", "/usr/bin", "/usr/local/bin"].map(std::path::PathBuf::from));
+        for dir in &dirs {
+            let candidate = dir.join(name);
+            let usable = match std::fs::metadata(&candidate) {
+                Ok(metadata) => {
+                    if !metadata.is_file() {
+                        false
+                    } else {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            (metadata.permissions().mode() & 0o111) != 0
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            true
+                        }
+                    }
+                }
+                Err(_) => false,
+            };
+            if usable {
+                let path = candidate.to_string_lossy().into_owned();
+                // Quote defensively so paths with spaces still split to one
+                // word (`nix/store` paths pass through untouched).
+                if path.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '/' | '.' | '_' | '-' | '+' | ':' | '@')
+                }) {
+                    return path;
+                }
+                return format!("'{}'", path.replace('\'', "'\\''"));
+            }
+        }
+        panic!("test tool `{name}` not found in PATH nor in /bin, /usr/bin, /usr/local/bin");
+    }
+
     #[test]
     fn channel_open_uses_stream_index_as_id() {
         assert_eq!(encode_channel_id(7), vec![0, 0, 0, 7]);
@@ -3890,7 +3939,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut data_writer, _data_reader, id) = session.open_channel("true").await;
+        let (mut data_writer, _data_reader, id) = session.open_channel(&test_tool("true")).await;
         session
             .control_writer
             .send(MSG_CHANNEL_EOF, &encode_channel_id(id))
@@ -3903,7 +3952,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_eof_does_not_replace_peer_fin() {
         let mut session = RawSession::start(SessionConfig::default()).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
         session
             .control_writer
             .send(MSG_CHANNEL_EOF, &encode_channel_id(id))
@@ -3974,7 +4023,11 @@ mod tests {
     async fn closed_output_pipes_still_emit_exit_status() {
         let mut session = RawSession::start(SessionConfig::default()).await;
         let (mut data_writer, mut data_reader, id) = session
-            .open_channel("sh -c 'exec 1>&- 2>&-; sleep 0.2'")
+            .open_channel(&format!(
+                "{} -c 'exec 1>&- 2>&-; {} 0.2'",
+                test_tool("sh"),
+                test_tool("sleep")
+            ))
             .await;
 
         session
@@ -4034,7 +4087,7 @@ mod tests {
             ..SessionConfig::default()
         };
         let mut session = RawSession::start(config).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
 
         session
             .control_writer
@@ -4093,8 +4146,13 @@ mod tests {
             ..SessionConfig::default()
         };
         let mut session = RawSession::start(config).await;
-        let (mut data_writer, mut data_reader, id) =
-            session.open_channel("sh -c 'printf ready; cat'").await;
+        let (mut data_writer, mut data_reader, id) = session
+            .open_channel(&format!(
+                "{} -c 'printf ready; {}'",
+                test_tool("sh"),
+                test_tool("cat")
+            ))
+            .await;
 
         let frame = timeout(Duration::from_secs(2), data_reader.next())
             .await
@@ -4144,7 +4202,7 @@ mod tests {
 
         // The peer CLOSE arrived before the worker observed FIN. The channel
         // must still be released when the worker completes, not at timeout.
-        let (mut next_writer, mut next_reader, next_id) = session.open_channel("true").await;
+        let (mut next_writer, mut next_reader, next_id) = session.open_channel(&test_tool("true")).await;
         assert_ne!(next_id, id);
         next_writer.finish().await.unwrap();
         timeout(Duration::from_secs(2), async {
@@ -4308,7 +4366,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("true".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(test_tool("true"))).unwrap(),
             )
             .await
             .unwrap();
@@ -4389,7 +4447,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("true".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(test_tool("true"))).unwrap(),
             )
             .await
             .unwrap();
@@ -4465,7 +4523,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("cat".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(test_tool("cat"))).unwrap(),
             )
             .await
             .unwrap();
@@ -4552,7 +4610,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("echo must-not-run".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(format!("{} must-not-run", test_tool("echo")))).unwrap(),
             )
             .await
             .unwrap();
@@ -4591,7 +4649,7 @@ mod tests {
             .unwrap();
 
         // A malformed channel must not poison unrelated channels.
-        let (mut next_writer, mut next_reader, next_id) = session.open_channel("true").await;
+        let (mut next_writer, mut next_reader, next_id) = session.open_channel(&test_tool("true")).await;
         next_writer.finish().await.unwrap();
         while next_reader.next().await.unwrap().is_some() {}
         session.wait_for_close(next_id).await;
@@ -4708,7 +4766,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("cat".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(test_tool("cat"))).unwrap(),
             )
             .await
             .unwrap();
@@ -4770,7 +4828,7 @@ mod tests {
             .unwrap();
         assert_eq!(frame.number, MSG_REQUEST_SUCCESS);
 
-        let (mut data_writer, mut data_reader, id) = session.open_channel("printf later").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&format!("{} later", test_tool("printf"))).await;
         data_writer.finish().await.unwrap();
         while data_reader.next().await.unwrap().is_some() {}
         session.wait_for_close(id).await;
@@ -4820,7 +4878,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("cat".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(test_tool("cat"))).unwrap(),
             )
             .await
             .unwrap();
@@ -4917,7 +4975,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let (mut next_writer, mut next_reader, next_id) = session.open_channel("true").await;
+        let (mut next_writer, mut next_reader, next_id) = session.open_channel(&test_tool("true")).await;
         assert_ne!(next_id, id);
         next_writer.finish().await.unwrap();
         while next_reader.next().await.unwrap().is_some() {}
@@ -5016,7 +5074,7 @@ mod tests {
             ..SessionConfig::default()
         };
         let mut session = RawSession::start(config).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
 
         data_writer
             .send(MSG_CHANNEL_DATA, &encode_channel_id(id))
@@ -5095,7 +5153,7 @@ mod tests {
             ..SessionConfig::default()
         };
         let mut session = RawSession::start(config).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
         session
             .control_writer
             .send(MSG_CHANNEL_EOF, &encode_channel_id(id))
@@ -5162,7 +5220,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_request_after_close_is_a_connection_error() {
         let mut session = RawSession::start(SessionConfig::default()).await;
-        let (mut data_writer, _data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, _data_reader, id) = session.open_channel(&test_tool("cat")).await;
         session
             .control_writer
             .send(MSG_CHANNEL_CLOSE, &encode_channel_id(id))
@@ -5172,7 +5230,7 @@ mod tests {
             .control_writer
             .send(
                 MSG_CHANNEL_REQUEST,
-                &encode_channel_request(id, &Command::Exec("echo should-not-run".into())).unwrap(),
+                &encode_channel_request(id, &Command::Exec(format!("{} should-not-run", test_tool("echo")))).unwrap(),
             )
             .await
             .unwrap();
@@ -5247,7 +5305,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_close_kills_a_stalled_input_worker_without_fin() {
         let mut session = RawSession::start(SessionConfig::default()).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
         session
             .control_writer
             .send(MSG_CHANNEL_CLOSE, &encode_channel_id(id))
@@ -5289,7 +5347,9 @@ mod tests {
                 .as_nanos()
         ));
         let command = format!(
-            "sh -c 'sleep 60 & child=$!; printf \"%s %s\" \"$$\" \"$child\" > {}; wait'",
+            "{} -c '{} 60 & child=$!; printf \"%s %s\" \"$$\" \"$child\" > {}; wait'",
+            test_tool("sh"),
+            test_tool("sleep"),
             pid_path.display()
         );
         let config = SessionConfig {
@@ -5349,7 +5409,9 @@ mod tests {
                 .as_nanos()
         ));
         let command = format!(
-            "sh -c 'sleep 60 & child=$!; printf \"%s %s\" \"$$\" \"$child\" > {}; wait'",
+            "{} -c '{} 60 & child=$!; printf \"%s %s\" \"$$\" \"$child\" > {}; wait'",
+            test_tool("sh"),
+            test_tool("sleep"),
             pid_path.display()
         );
         let mut session = RawSession::start(SessionConfig::default()).await;
@@ -5389,8 +5451,10 @@ mod tests {
                 .as_nanos()
         ));
         let command = format!(
-            "sh -c 'printf \"%s\" \"$$\" > {}; sleep 60'",
-            pid_path.display()
+            "{} -c 'printf \"%s\" \"$$\" > {}; {} 60'",
+            test_tool("sh"),
+            pid_path.display(),
+            test_tool("sleep")
         );
         let mut session = RawSession::start(SessionConfig::default()).await;
         let (_data_writer, _data_reader, id) = session.open_channel(&command).await;
@@ -5416,7 +5480,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn malformed_channel_data_has_terminal_sequence_before_close() {
         let mut session = RawSession::start(SessionConfig::default()).await;
-        let (mut data_writer, mut data_reader, id) = session.open_channel("cat").await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
         data_writer
             .send(MSG_CHANNEL_DATA, &encode_channel_id(id))
             .await
@@ -5869,7 +5933,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shell_request_runs_the_configured_login_shell() {
         let config = SessionConfig {
-            login_shell: Some("/bin/sh".into()),
+            login_shell: Some(test_tool("sh")),
             ..SessionConfig::default()
         };
         let key_path = std::env::temp_dir().join(format!(
@@ -6038,7 +6102,7 @@ mod tests {
         let (mut stderr_reader, mut stderr_writer) = tokio::io::duplex(1024);
         let status_result = client
             .exec(
-                Command::Exec("sh -c 'printf hello; printf oops >&2'".into()),
+                Command::Exec(format!("{} -c 'printf hello; printf oops >&2'", test_tool("sh"))),
                 &mut input,
                 &mut stdout_writer,
                 &mut stderr_writer,
