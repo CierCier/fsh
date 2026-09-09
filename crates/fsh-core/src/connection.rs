@@ -123,6 +123,9 @@ pub struct SessionConfig {
     pub close_timeout: Duration,
     pub request_timeout: Duration,
     pub max_command_bytes: usize,
+    /// Shell program for `shell` requests. When unset the daemon resolves the
+    /// login shell of the account it runs as.
+    pub login_shell: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -132,6 +135,7 @@ impl Default for SessionConfig {
             close_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
             max_command_bytes: MAX_COMMAND_BYTES,
+            login_shell: None,
         }
     }
 }
@@ -1387,13 +1391,8 @@ impl ServerSession {
                             seen.insert(id);
                             let mut state = ServerChannel::new(id, self.config.request_timeout);
                             send_control(&self.control_writer, MSG_CHANNEL_OPEN_CONFIRM, encode_channel_id(id)).await?;
-                            maybe_start_worker(
-                                &mut state,
-                                &self.control_writer,
-                                &events_tx,
-                                self.config.close_timeout,
-                            )
-                            .await?;
+                            maybe_start_worker(&mut state, &self.config, &self.control_writer, &events_tx)
+                                .await?;
                             channels.insert(id, state);
                         }
                         MSG_CHANNEL_REQUEST => {
@@ -1437,13 +1436,8 @@ impl ServerSession {
                                         self.config.max_command_bytes.min(MAX_COMMAND_BYTES),
                                     )
                                     .await?;
-                                    maybe_start_worker(
-                                        state,
-                                        &self.control_writer,
-                                        &events_tx,
-                                        self.config.close_timeout,
-                                    )
-                                    .await?;
+                                    maybe_start_worker(state, &self.config, &self.control_writer, &events_tx)
+                                        .await?;
                                 }
                             } else if request.want_reply {
                                 send_control(&self.control_writer, MSG_CHANNEL_FAILURE, encode_channel_id(id)).await?;
@@ -1593,13 +1587,8 @@ impl ServerSession {
                                             self.config.max_command_bytes.min(MAX_COMMAND_BYTES),
                                         )
                                         .await?;
-                                        maybe_start_worker(
-                                            state,
-                                            &self.control_writer,
-                                            &events_tx,
-                                            self.config.close_timeout,
-                                        )
-                                        .await?;
+                                        maybe_start_worker(state, &self.config, &self.control_writer, &events_tx)
+                                            .await?;
                                     }
                                 } else {
                                     let (send, reader) = stream;
@@ -1640,13 +1629,8 @@ impl ServerSession {
                                             &self.control_writer,
                                         );
                                     } else {
-                                        maybe_start_worker(
-                                            state,
-                                            &self.control_writer,
-                                            &events_tx,
-                                            self.config.close_timeout,
-                                        )
-                                        .await?;
+                                        maybe_start_worker(state, &self.config, &self.control_writer, &events_tx)
+                                            .await?;
                                     }
                                 } else {
                                     let (send, reader) = stream;
@@ -2149,9 +2133,9 @@ async fn run_channel_activation(
 
 async fn maybe_start_worker(
     state: &mut ServerChannel,
+    config: &SessionConfig,
     control_writer: &ControlWriter,
     events: &mpsc::UnboundedSender<WorkerEvent>,
-    close_timeout: Duration,
 ) -> Result<()> {
     if state.worker_handle.is_some()
         || state.stream.is_none()
@@ -2176,6 +2160,8 @@ async fn maybe_start_worker(
     }
     state.worker_tx = Some(worker_tx);
     let events = events.clone();
+    let login_shell = config.login_shell.clone();
+    let close_timeout = config.close_timeout;
     state.worker_handle = Some(tokio::spawn(async move {
         let result = run_channel_worker(
             id,
@@ -2186,6 +2172,7 @@ async fn maybe_start_worker(
             writer,
             worker_rx,
             events.clone(),
+            login_shell,
             close_timeout,
         )
         .await;
@@ -2364,9 +2351,10 @@ async fn run_channel_worker(
     control_writer: ControlWriter,
     mut commands: mpsc::Receiver<WorkerCommand>,
     events: mpsc::UnboundedSender<WorkerEvent>,
+    login_shell: Option<String>,
     close_timeout: Duration,
 ) -> Result<WorkerOutcome> {
-    let mut process = match spawn_process(&command) {
+    let mut process = match spawn_process(&command, login_shell.as_deref()) {
         Ok(process) => process,
         Err(_error) => {
             // A rejected command still owns an accepted channel stream. Make
@@ -2723,7 +2711,71 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-fn spawn_process(command: &Command) -> Result<tokio::process::Child> {
+/// The passwd entry of the account the daemon runs as. The MVP serves a
+/// single configured user, so the account's own login shell is the shell
+/// that `shell` requests must start.
+struct Account {
+    name: String,
+    home: String,
+    shell: String,
+}
+
+#[cfg(unix)]
+fn account_info() -> Option<Account> {
+    use std::ffi::CStr;
+
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    // getpwuid_r needs scratch space for the strings it points into.
+    let mut buffer = vec![0u8; 8192];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(entry.pw_name) }.to_str().ok()?;
+    let home = unsafe { CStr::from_ptr(entry.pw_dir) }.to_str().ok()?;
+    let shell = unsafe { CStr::from_ptr(entry.pw_shell) }.to_str().ok()?;
+    if name.is_empty() || home.is_empty() {
+        return None;
+    }
+    Some(Account {
+        name: name.to_owned(),
+        home: home.to_owned(),
+        shell: if shell.is_empty() {
+            "/bin/sh".to_owned()
+        } else {
+            shell.to_owned()
+        },
+    })
+}
+
+#[cfg(not(unix))]
+fn account_info() -> Option<Account> {
+    None
+}
+
+/// Resolve the program to run for a `shell` request: the daemon account's
+/// login shell, overridable through `SessionConfig::login_shell`, falling
+/// back to `/bin/sh`.
+fn resolve_shell(login_shell: Option<&str>) -> String {
+    if let Some(shell) = login_shell {
+        return shell.to_owned();
+    }
+    account_info()
+        .map(|account| account.shell)
+        .unwrap_or_else(|| "/bin/sh".to_owned())
+}
+
+fn spawn_process(command: &Command, login_shell: Option<&str>) -> Result<tokio::process::Child> {
+    let account = account_info();
     let mut process = match command {
         Command::Exec(command) => {
             let words = shell_words::split(command)
@@ -2736,13 +2788,23 @@ fn spawn_process(command: &Command) -> Result<tokio::process::Child> {
             process
         }
         Command::Shell => {
-            let mut process = TokioCommand::new("/bin/sh");
-            process.arg("-i");
-            process
+            // The connection contract starts the account's default shell.
+            // Without a pty the shell reads commands from the channel pipe,
+            // so no interactive flag is passed.
+            let shell = resolve_shell(login_shell);
+            TokioCommand::new(shell)
         }
     };
     process.env_clear();
     process.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    if let Some(account) = account {
+        let shell = resolve_shell(login_shell);
+        process.env("HOME", &account.home);
+        process.env("SHELL", shell);
+        process.env("USER", &account.name);
+        process.env("LOGNAME", &account.name);
+        process.env("PWD", &account.home);
+    }
     #[cfg(unix)]
     process.process_group(0);
     process.kill_on_drop(true);
@@ -2757,28 +2819,8 @@ fn spawn_process(command: &Command) -> Result<tokio::process::Child> {
 fn send_process_signal(pid: u32, name: &str) {
     #[cfg(unix)]
     {
-        let signal = match name {
-            "HUP" => libc::SIGHUP,
-            "INT" => libc::SIGINT,
-            "QUIT" => libc::SIGQUIT,
-            "ILL" => libc::SIGILL,
-            "TRAP" => libc::SIGTRAP,
-            "ABRT" => libc::SIGABRT,
-            "BUS" => libc::SIGBUS,
-            "FPE" => libc::SIGFPE,
-            "KILL" => libc::SIGKILL,
-            "USR1" => libc::SIGUSR1,
-            "SEGV" => libc::SIGSEGV,
-            "USR2" => libc::SIGUSR2,
-            "PIPE" => libc::SIGPIPE,
-            "ALRM" => libc::SIGALRM,
-            "TERM" => libc::SIGTERM,
-            "CHLD" => libc::SIGCHLD,
-            "CONT" => libc::SIGCONT,
-            "STOP" => libc::SIGSTOP,
-            "TSTP" => libc::SIGTSTP,
-            "URG" => libc::SIGURG,
-            _ => return,
+        let Some(signal) = signal_number(name) else {
+            return;
         };
         // process_group(0) creates a group whose id is the child pid.
         unsafe {
@@ -2792,31 +2834,55 @@ async fn send_exit_notification(
     channel_id: u32,
     status: &std::process::ExitStatus,
 ) -> Result<()> {
+    let payload = encode_exit_notification(channel_id, status)?;
+    send_control(writer, MSG_CHANNEL_REQUEST, payload).await
+}
+
+fn encode_exit_notification(channel_id: u32, status: &std::process::ExitStatus) -> Result<Vec<u8>> {
     let status = *status;
     let mut encoder = Encoder::new();
     encoder.u32(channel_id);
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
+        if let Some(signal) = status.signal()
+            && let Some(name) = signal_name(signal)
+        {
             encoder.string("exit-signal")?;
             encoder.boolean(false);
-            encoder.string(signal_name(signal))?;
+            encoder.string(name)?;
             encoder.boolean(status.core_dumped());
             encoder.string("process terminated by signal")?;
             encoder.string("")?;
-            return send_control(writer, MSG_CHANNEL_REQUEST, encoder.finish()).await;
+            return Ok(encoder.finish());
         }
+        // An unrecognized signal number must not be misreported as TERM.
+        // Report the conventional 128+n exit status so the client still
+        // surfaces the true termination cause.
     }
-    encoder.string("exit-status")?;
-    encoder.boolean(false);
-    encoder.u32(status.code().unwrap_or(1) as u32);
-    send_control(writer, MSG_CHANNEL_REQUEST, encoder.finish()).await
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let code = status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+            .unwrap_or(1);
+        encoder.string("exit-status")?;
+        encoder.boolean(false);
+        encoder.u32(code as u32);
+    }
+    #[cfg(not(unix))]
+    {
+        encoder.string("exit-status")?;
+        encoder.boolean(false);
+        encoder.u32(status.code().unwrap_or(1) as u32);
+    }
+    Ok(encoder.finish())
 }
 
 #[cfg(unix)]
-fn signal_name(signal: i32) -> &'static str {
-    match signal {
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
         libc::SIGHUP => "HUP",
         libc::SIGINT => "INT",
         libc::SIGQUIT => "QUIT",
@@ -2832,12 +2898,70 @@ fn signal_name(signal: i32) -> &'static str {
         libc::SIGPIPE => "PIPE",
         libc::SIGALRM => "ALRM",
         libc::SIGTERM => "TERM",
+        libc::SIGSTKFLT => "STKFLT",
         libc::SIGCHLD => "CHLD",
         libc::SIGCONT => "CONT",
         libc::SIGSTOP => "STOP",
         libc::SIGTSTP => "TSTP",
+        libc::SIGTTIN => "TTIN",
+        libc::SIGTTOU => "TTOU",
         libc::SIGURG => "URG",
-        _ => "TERM",
+        libc::SIGXCPU => "XCPU",
+        libc::SIGXFSZ => "XFSZ",
+        libc::SIGVTALRM => "VTALRM",
+        libc::SIGPROF => "PROF",
+        libc::SIGWINCH => "WINCH",
+        libc::SIGIO => "IO",
+        libc::SIGPWR => "PWR",
+        libc::SIGSYS => "SYS",
+        _ => return None,
+    })
+}
+
+/// Map an SSH-style signal name (no `SIG` prefix) to its number. Shared by
+/// the daemon, which sends signals, and the client, which reports
+/// `128 + number` for a signaled remote command.
+pub fn signal_number(name: &str) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        Some(match name {
+            "HUP" => libc::SIGHUP,
+            "INT" => libc::SIGINT,
+            "QUIT" => libc::SIGQUIT,
+            "ILL" => libc::SIGILL,
+            "TRAP" => libc::SIGTRAP,
+            "ABRT" => libc::SIGABRT,
+            "BUS" => libc::SIGBUS,
+            "FPE" => libc::SIGFPE,
+            "KILL" => libc::SIGKILL,
+            "USR1" => libc::SIGUSR1,
+            "SEGV" => libc::SIGSEGV,
+            "USR2" => libc::SIGUSR2,
+            "PIPE" => libc::SIGPIPE,
+            "ALRM" => libc::SIGALRM,
+            "TERM" => libc::SIGTERM,
+            "STKFLT" => libc::SIGSTKFLT,
+            "CHLD" => libc::SIGCHLD,
+            "CONT" => libc::SIGCONT,
+            "STOP" => libc::SIGSTOP,
+            "TSTP" => libc::SIGTSTP,
+            "TTIN" => libc::SIGTTIN,
+            "TTOU" => libc::SIGTTOU,
+            "URG" => libc::SIGURG,
+            "XCPU" => libc::SIGXCPU,
+            "XFSZ" => libc::SIGXFSZ,
+            "VTALRM" => libc::SIGVTALRM,
+            "PROF" => libc::SIGPROF,
+            "WINCH" => libc::SIGWINCH,
+            "IO" => libc::SIGIO,
+            "PWR" => libc::SIGPWR,
+            "SYS" => libc::SIGSYS,
+            _ => return None,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
@@ -3418,31 +3542,7 @@ fn is_transport_shutdown(error: &Error) -> bool {
 }
 
 fn valid_signal(name: &str) -> bool {
-    name.len() <= MAX_SIGNAL_BYTES
-        && name.is_ascii()
-        && matches!(
-            name,
-            "HUP"
-                | "INT"
-                | "QUIT"
-                | "ILL"
-                | "TRAP"
-                | "ABRT"
-                | "BUS"
-                | "FPE"
-                | "KILL"
-                | "USR1"
-                | "SEGV"
-                | "USR2"
-                | "PIPE"
-                | "ALRM"
-                | "TERM"
-                | "CHLD"
-                | "CONT"
-                | "STOP"
-                | "TSTP"
-                | "URG"
-        )
+    name.len() <= MAX_SIGNAL_BYTES && name.is_ascii() && signal_number(name).is_some()
 }
 
 #[cfg(test)]
@@ -3509,6 +3609,50 @@ mod tests {
             decode_disconnect(&encoder.finish()),
             Err(Error::RemoteDisconnect(_))
         ));
+    }
+
+    #[test]
+    fn signal_tables_round_trip_every_standard_signal() {
+        for signal in 1..=31 {
+            if let Some(name) = signal_name(signal) {
+                assert_eq!(signal_number(name), Some(signal), "signal {name}");
+            }
+        }
+        // The previously misreported signals keep their own names now.
+        assert_eq!(signal_name(libc::SIGXCPU), Some("XCPU"));
+        assert_eq!(signal_number("XCPU"), Some(libc::SIGXCPU));
+        assert_eq!(signal_name(libc::SIGXFSZ), Some("XFSZ"));
+        // Unrecognized numbers stay unrecognized instead of degrading to TERM.
+        assert_eq!(signal_name(64), None);
+        assert_eq!(signal_number("NOTASIGNAL"), None);
+    }
+
+    #[test]
+    fn unknown_signal_numbers_report_numeric_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // A recognized signal keeps the exit-signal report with its true name.
+        let known = encode_exit_notification(7, &std::process::ExitStatus::from_raw(libc::SIGXCPU))
+            .unwrap();
+        let mut decoder = Decoder::new(&known);
+        assert_eq!(decoder.u32().unwrap(), 7);
+        assert_eq!(decoder.string().unwrap(), "exit-signal");
+        assert!(!decoder.boolean().unwrap());
+        assert_eq!(decoder.string().unwrap(), "XCPU");
+        assert!(!decoder.boolean().unwrap());
+        assert_eq!(decoder.string().unwrap(), "process terminated by signal");
+        assert_eq!(decoder.string().unwrap(), "");
+        decoder.finish().unwrap();
+
+        // An unrecognized signal number must not be misreported as TERM; it
+        // degrades to the conventional 128+n exit status.
+        let unknown = encode_exit_notification(7, &std::process::ExitStatus::from_raw(64)).unwrap();
+        let mut decoder = Decoder::new(&unknown);
+        assert_eq!(decoder.u32().unwrap(), 7);
+        assert_eq!(decoder.string().unwrap(), "exit-status");
+        assert!(!decoder.boolean().unwrap());
+        assert_eq!(decoder.u32().unwrap(), 128 + 64);
+        decoder.finish().unwrap();
     }
 
     struct RawSession {
@@ -5703,6 +5847,112 @@ mod tests {
         server_transport
             .endpoint
             .close(0u32.into(), b"test complete");
+        let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(server_key_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_request_runs_the_configured_login_shell() {
+        let config = SessionConfig {
+            login_shell: Some("/bin/sh".into()),
+            ..SessionConfig::default()
+        };
+        let key_path = std::env::temp_dir().join(format!(
+            "fsh-shell-test-{}-{}.key",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cert_path = key_path.with_extension("cert");
+        let server_key_path = key_path.with_extension("server-key");
+        let identity = Identity::generate_ed25519(&key_path).unwrap();
+        let authorized =
+            AuthorizedKeys::from_lines(&identity.public_key().to_openssh().unwrap()).unwrap();
+        let server_identity =
+            crate::ServerIdentity::generate(&cert_path, &server_key_path).unwrap();
+        let server_transport =
+            make_server_endpoint("127.0.0.1:0".parse().unwrap(), server_identity).unwrap();
+        let server_pin = server_transport.identity.pin();
+        let server_endpoint = server_transport.endpoint.clone();
+        let server_address = server_endpoint.local_addr().unwrap();
+        let server_config = config.clone();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (send, recv) = connection.accept_bi().await.unwrap();
+            let auth = UserAuthServer {
+                authorized_keys: authorized,
+                expected_username: Some("alice".into()),
+            };
+            let (_, reader, writer) = auth
+                .authenticate(
+                    &connection,
+                    FramedReader::new(recv),
+                    FramedWriter::new(send),
+                )
+                .await
+                .unwrap();
+            ServerSession::new(connection, reader, writer, server_config)
+                .run()
+                .await
+        });
+
+        let client_transport =
+            make_client_endpoint("127.0.0.1:0".parse().unwrap(), Some(server_pin)).unwrap();
+        let auth = UserAuthClient {
+            username: "alice".into(),
+            identity,
+        };
+        let mut client = ClientSession::connect(
+            &client_transport.endpoint,
+            server_address,
+            "fsh.local",
+            auth,
+            config,
+        )
+        .await
+        .unwrap();
+        // The client reads `input`; feed it through the peer half, like a
+        // live terminal pipe, and keep that half open so the drain path for
+        // still-open stdin is exercised.
+        let (mut input, mut input_writer) = tokio::io::duplex(1024);
+        input_writer
+            .write_all(b"printf shell-marker\nexit\n")
+            .await
+            .unwrap();
+        let (mut stdout_reader, mut stdout_writer) = tokio::io::duplex(1024);
+        let (mut stderr_reader, mut stderr_writer) = tokio::io::duplex(1024);
+        let status_result = client
+            .exec(
+                Command::Shell,
+                &mut input,
+                &mut stdout_writer,
+                &mut stderr_writer,
+            )
+            .await;
+        drop(stdout_writer);
+        drop(stderr_writer);
+        let mut stdout = Vec::new();
+        stdout_reader.read_to_end(&mut stdout).await.unwrap();
+        let mut stderr = Vec::new();
+        stderr_reader.read_to_end(&mut stderr).await.unwrap();
+        client.connection().close(0u32.into(), b"test complete");
+        client_transport
+            .endpoint
+            .close(0u32.into(), b"test complete");
+        server_transport
+            .endpoint
+            .close(0u32.into(), b"test complete");
+        let server_result = server_task.await.unwrap();
+        assert!(
+            server_result.is_ok(),
+            "server session failed: {server_result:?}"
+        );
+        assert_eq!(status_result.unwrap(), ExitStatus::Code(0));
+        assert_eq!(stdout, b"shell-marker");
+        assert_eq!(stderr, Vec::<u8>::new());
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(cert_path);
         let _ = std::fs::remove_file(server_key_path);

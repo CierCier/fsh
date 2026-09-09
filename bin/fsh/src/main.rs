@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use fsh_core::{
-    ClientSession, ClientTransport, Command, Identity, KnownHosts, SessionConfig, SpkiPin,
-    UserAuthClient, make_client_endpoint,
+    ClientSession, ClientTransport, Command, ExitStatus, Identity, KnownHosts, SessionConfig,
+    SpkiPin, UserAuthClient, make_client_endpoint, signal_number,
 };
 
 #[derive(Debug, Parser)]
@@ -273,49 +273,23 @@ fn shell_quote(argument: &str) -> String {
     }
 }
 
-fn exit_status_code(status: impl std::fmt::Debug) -> Result<i32> {
-    let status = format!("{status:?}");
-    if let Some(code) = status
-        .strip_prefix("Code(")
-        .and_then(|value| value.strip_suffix(')'))
-    {
-        let code = code.parse::<u32>().context("parsing remote exit-status")?;
-        return Ok(i32::try_from(code).unwrap_or(1));
+fn exit_status_code(status: ExitStatus) -> Result<i32> {
+    match status {
+        ExitStatus::Code(code) => Ok(i32::try_from(code).unwrap_or(1)),
+        ExitStatus::Signal {
+            name,
+            core_dumped: _,
+            message: _,
+        } => {
+            if let Some(number) = signal_number(&name) {
+                eprintln!("fsh: remote command terminated by signal {name}");
+                Ok(128 + number)
+            } else {
+                eprintln!("fsh: remote command terminated by signal {name}");
+                Ok(1)
+            }
+        }
     }
-
-    let name = status
-        .strip_prefix("Signal { name: \"")
-        .and_then(|value| value.split_once('"'))
-        .map(|(name, _)| name)
-        .ok_or_else(|| anyhow::anyhow!("unrecognized remote exit status: {status}"))?;
-    eprintln!("fsh: remote command terminated by signal {name}");
-    Ok(128 + signal_number(name).unwrap_or(1))
-}
-
-fn signal_number(name: &str) -> Option<i32> {
-    Some(match name {
-        "HUP" => 1,
-        "INT" => 2,
-        "QUIT" => 3,
-        "ILL" => 4,
-        "TRAP" => 5,
-        "ABRT" => 6,
-        "BUS" => 7,
-        "FPE" => 8,
-        "KILL" => 9,
-        "USR1" => 10,
-        "SEGV" => 11,
-        "USR2" => 12,
-        "PIPE" => 13,
-        "ALRM" => 14,
-        "TERM" => 15,
-        "CHLD" => 17,
-        "CONT" => 18,
-        "STOP" => 19,
-        "TSTP" => 20,
-        "URG" => 23,
-        _ => return None,
-    })
 }
 
 fn display_pin(pin: SpkiPin) -> String {
@@ -385,5 +359,38 @@ fn home_dir() -> Option<PathBuf> {
 fn log_info(verbose: u8, message: impl std::fmt::Display) {
     if verbose > 0 {
         eprintln!("fsh: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_status_maps_remote_codes_directly() {
+        assert_eq!(exit_status_code(ExitStatus::Code(0)).unwrap(), 0);
+        assert_eq!(exit_status_code(ExitStatus::Code(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn exit_status_maps_known_signals_to_128_plus_number() {
+        let status = ExitStatus::Signal {
+            name: "XCPU".into(),
+            core_dumped: false,
+            message: String::new(),
+        };
+        assert_eq!(exit_status_code(status).unwrap(), 128 + 24);
+    }
+
+    #[test]
+    fn exit_status_survives_unknown_signal_names() {
+        // A peer that reports an unknown signal name must not crash the
+        // client or fabricate a wrong exit status.
+        let status = ExitStatus::Signal {
+            name: "BOGUS".into(),
+            core_dumped: false,
+            message: String::new(),
+        };
+        assert_eq!(exit_status_code(status).unwrap(), 1);
     }
 }

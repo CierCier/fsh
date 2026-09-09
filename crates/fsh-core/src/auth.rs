@@ -406,14 +406,95 @@ pub struct UserAuthServer {
     pub expected_username: Option<String>,
 }
 
+/// The authenticated boundary of a server-side userauth exchange.
+///
+/// [`UserAuthServer::verify`] verifies the client's proof and answers
+/// `USERAUTH_SUCCESS`; dropping the guard before [`finish`](Self::finish)
+/// aborts the connection. The daemon stops its pre-authentication stream
+/// quarantine between the two phases, so a channel stream that a legitimate
+/// client opens immediately after authentication cannot be accepted and reset
+/// by the quarantine.
+pub struct VerifiedAuth {
+    username: Option<String>,
+    connection: Option<quinn::Connection>,
+}
+
+impl VerifiedAuth {
+    pub fn username(&self) -> &str {
+        self.username
+            .as_deref()
+            .expect("username is present until finish")
+    }
+
+    /// Transition to the connection service and hand back the control stream.
+    ///
+    /// `reader` and `writer` must be the same stream pair passed to
+    /// [`verify`](UserAuthServer::verify).
+    pub async fn finish(
+        mut self,
+        mut reader: FramedReader<quinn::RecvStream>,
+        mut writer: FramedWriter<quinn::SendStream>,
+    ) -> Result<(
+        String,
+        FramedReader<quinn::RecvStream>,
+        FramedWriter<quinn::SendStream>,
+    )> {
+        let connection = self
+            .connection
+            .take()
+            .expect("connection is present until finish");
+        if send_frame(&mut writer, MSG_USERAUTH_SUCCESS, Vec::new())
+            .await
+            .is_err()
+        {
+            connection.close(1u32.into(), b"authentication success write failed");
+            return Err(Error::Protocol(
+                "cannot complete authentication: success write failed".into(),
+            ));
+        }
+        match expect_service_request(&connection, &mut reader, &mut writer, CONNECTION_SERVICE)
+            .await
+        {
+            Ok(()) => Ok((
+                self.username
+                    .take()
+                    .expect("username is present until finish"),
+                reader,
+                writer,
+            )),
+            Err(error) => {
+                connection.close(1u32.into(), b"connection service failed");
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for VerifiedAuth {
+    fn drop(&mut self) {
+        // Abandoning the boundary without finishing aborts the connection;
+        // a finished guard no longer owns it.
+        if let Some(connection) = self.connection.take()
+            && connection.close_reason().is_none()
+        {
+            connection.close(1u32.into(), b"authentication boundary dropped");
+        }
+    }
+}
+
 impl UserAuthServer {
-    pub async fn authenticate(
+    /// Run the userauth exchange and return once the client's proof has been
+    /// verified. The returned guard holds the connection open until
+    /// [`VerifiedAuth::finish`] completes the service transition. The control
+    /// stream pair is returned alongside so the daemon can stop its
+    /// quarantine before finishing.
+    pub async fn verify(
         &self,
         connection: &quinn::Connection,
         mut reader: FramedReader<quinn::RecvStream>,
         mut writer: FramedWriter<quinn::SendStream>,
     ) -> Result<(
-        String,
+        VerifiedAuth,
         FramedReader<quinn::RecvStream>,
         FramedWriter<quinn::SendStream>,
     )> {
@@ -504,12 +585,37 @@ impl UserAuthServer {
                 send_failure(&mut writer).await?;
                 continue;
             }
-            send_frame(&mut writer, MSG_USERAUTH_SUCCESS, Vec::new()).await?;
+            // USERAUTH_SUCCESS is deliberately deferred to
+            // `VerifiedAuth::finish` so the daemon can quiesce its
+            // pre-authentication stream quarantine before the client learns
+            // that authentication succeeded.
             break request.user;
         };
 
-        expect_service_request(connection, &mut reader, &mut writer, CONNECTION_SERVICE).await?;
-        Ok((username, reader, writer))
+        Ok((
+            VerifiedAuth {
+                username: Some(username),
+                connection: Some(connection.clone()),
+            },
+            reader,
+            writer,
+        ))
+    }
+
+    /// Run userauth and the connection-service transition together. See
+    /// [`verify`](Self::verify) for the two-phase form.
+    pub async fn authenticate(
+        &self,
+        connection: &quinn::Connection,
+        reader: FramedReader<quinn::RecvStream>,
+        writer: FramedWriter<quinn::SendStream>,
+    ) -> Result<(
+        String,
+        FramedReader<quinn::RecvStream>,
+        FramedWriter<quinn::SendStream>,
+    )> {
+        let (verified, reader, writer) = self.verify(connection, reader, writer).await?;
+        verified.finish(reader, writer).await
     }
 }
 
@@ -1204,6 +1310,114 @@ mod tests {
             .endpoint
             .close(0u32.into(), b"test complete");
         assert!(server_task.await.unwrap().is_ok());
+        let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(server_key_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_verify_defers_success_until_finish() {
+        let stem = format!(
+            "fsh-auth-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let key_path = std::env::temp_dir().join(format!("{stem}.key"));
+        let cert_path = std::env::temp_dir().join(format!("{stem}.cert"));
+        let server_key_path = std::env::temp_dir().join(format!("{stem}.server-key"));
+        let identity = Identity::generate_ed25519(&key_path).unwrap();
+        let authorized =
+            AuthorizedKeys::from_lines(&identity.public_key().to_openssh().unwrap()).unwrap();
+        let server_identity = ServerIdentity::generate(&cert_path, &server_key_path).unwrap();
+        let server_transport = make_server_endpoint(
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            server_identity,
+        )
+        .unwrap();
+        let server_address = server_transport.endpoint.local_addr().unwrap();
+        let server_endpoint = server_transport.endpoint.clone();
+        let (boundary_tx, boundary_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            let (send, recv) = connection.accept_bi().await.unwrap();
+            let auth = UserAuthServer {
+                authorized_keys: authorized,
+                expected_username: Some("alice".into()),
+            };
+            let (verified, reader, writer) = auth
+                .verify(
+                    &connection,
+                    FramedReader::new(recv),
+                    FramedWriter::new(send),
+                )
+                .await
+                .unwrap();
+            // The daemon quiesces its quarantine here. The client must not
+            // have completed authentication yet: no USERAUTH_SUCCESS has
+            // been written.
+            let _ = boundary_tx.send(());
+            // Hold the boundary open until the test has asserted that.
+            let _ = release_rx.await;
+            verified.finish(reader, writer).await.unwrap()
+        });
+
+        let client_transport = make_client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            Some(server_transport.identity.pin()),
+        )
+        .unwrap();
+        let connection = client_transport
+            .endpoint
+            .connect(server_address, "fsh.local")
+            .unwrap()
+            .await
+            .unwrap();
+        let (send, recv) = connection.open_bi().await.unwrap();
+        let client_auth = UserAuthClient {
+            username: "alice".into(),
+            identity,
+        };
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = client_auth
+                .authenticate(
+                    &connection,
+                    FramedReader::new(recv),
+                    FramedWriter::new(send),
+                )
+                .await;
+            let _ = done_tx.send(result.is_ok());
+        });
+
+        timeout(Duration::from_secs(2), boundary_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(200), &mut done_rx)
+                .await
+                .is_err(),
+            "client completed authentication before the boundary was released"
+        );
+        let _ = release_tx.send(());
+        let (username, _reader, _writer) = server_task.await.unwrap();
+        assert_eq!(username, "alice");
+        assert!(
+            timeout(Duration::from_secs(2), done_rx)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        client_transport
+            .endpoint
+            .close(0u32.into(), b"test complete");
+        server_transport
+            .endpoint
+            .close(0u32.into(), b"test complete");
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(cert_path);
         let _ = std::fs::remove_file(server_key_path);

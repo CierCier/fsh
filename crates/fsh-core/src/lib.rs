@@ -11,7 +11,9 @@ mod tls;
 mod wire;
 
 pub use auth::{AuthorizedKeys, Identity, UserAuthClient, UserAuthServer};
-pub use connection::{ClientSession, Command, ServerSession, SessionConfig};
+pub use connection::{
+    ClientSession, Command, ExitStatus, ServerSession, SessionConfig, signal_number,
+};
 pub use error::{Error, Result};
 pub use tls::{
     ClientTransport, KnownHosts, ServerIdentity, ServerTransport, SpkiPin, make_client_endpoint,

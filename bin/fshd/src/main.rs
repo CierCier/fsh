@@ -36,6 +36,11 @@ struct Args {
     #[arg(long, env = "FSHD_USER", value_name = "USER")]
     user: Option<String>,
 
+    /// Shell program for `shell` requests. Defaults to the account's login
+    /// shell.
+    #[arg(long, env = "FSHD_SHELL", value_name = "SHELL")]
+    shell: Option<String>,
+
     /// Increase diagnostic output (-v, -vv).
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
@@ -69,6 +74,10 @@ async fn run(args: Args) -> Result<()> {
             authorized_keys_path.display()
         );
     }
+    let session_config = SessionConfig {
+        login_shell: args.shell.clone(),
+        ..SessionConfig::default()
+    };
 
     let pin = identity.pin();
     let transport = make_server_endpoint(args.listen, identity)
@@ -103,6 +112,7 @@ async fn run(args: Args) -> Result<()> {
                 };
                 let authorized_keys = authorized_keys.clone();
                 let expected_username = args.user.clone();
+                let session_config = session_config.clone();
                 let verbose = args.verbose;
                 tokio::spawn(async move {
                     match incoming.await {
@@ -138,21 +148,32 @@ async fn run(args: Args) -> Result<()> {
                                     connection.clone(),
                                     stop_rx,
                                 ));
-                                let auth_result = auth
-                                    .authenticate(
+                                let verified = auth
+                                    .verify(
                                         &connection,
                                         FramedReader::new(recv),
                                         FramedWriter::new(send),
                                     )
                                     .await;
+                                // No USERAUTH_SUCCESS has been sent yet, so
+                                // every stream the quarantine saw was opened
+                                // pre-authentication. Joining it here closes
+                                // the race where a post-auth channel stream
+                                // would be accepted and reset after the
+                                // session already confirmed its CHANNEL_OPEN.
                                 let _ = stop_tx.send(());
                                 let _ = quarantine.await;
-                                let (username, reader, writer) = auth_result
-                                    .context("authenticating client")?;
+                                let (username, reader, writer) = match verified {
+                                    Ok((verified, reader, writer)) => {
+                                        verified.finish(reader, writer).await
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                                .context("authenticating client")?;
                                 if verbose > 0 {
                                     eprintln!("fshd: authenticated {username} from {peer}");
                                 }
-                                ServerSession::new(connection, reader, writer, SessionConfig::default())
+                                ServerSession::new(connection, reader, writer, session_config)
                                     .run()
                                     .await
                                     .context("running session")

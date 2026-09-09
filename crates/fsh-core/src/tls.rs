@@ -389,12 +389,9 @@ impl ServerCertVerifier for PinnedVerifier {
 fn read_certificate(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(b"-----BEGIN") {
-        let mut reader = &bytes[..];
-        rustls_pemfile::certs(&mut reader)
+        pem_blocks(&bytes, "CERTIFICATE")?
+            .into_iter()
             .next()
-            .transpose()
-            .map_err(Error::Io)?
-            .map(|certificate| certificate.to_vec())
             .ok_or(Error::InvalidCertificate)
     } else {
         Ok(bytes)
@@ -404,12 +401,101 @@ fn read_certificate(path: &Path) -> Result<Vec<u8>> {
 fn read_private_key(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(b"-----BEGIN") {
-        let mut reader = &bytes[..];
-        let key = rustls_pemfile::private_key(&mut reader)
-            .map_err(Error::Io)?
-            .ok_or(Error::InvalidCertificate)?;
-        Ok(key.secret_der().to_vec())
+        // Only PKCS#8 PEM is accepted: it is what rustls-pki-types consumes
+        // and what `openssl genpkey` and rcgen emit by default.
+        pem_blocks(&bytes, "PRIVATE KEY")?
+            .into_iter()
+            .next()
+            .ok_or(Error::InvalidCertificate)
     } else {
         Ok(bytes)
+    }
+}
+
+/// Minimal RFC 7468 PEM block extraction for the given label. This replaces
+/// the unmaintained `rustls-pemfile` crate; FSH only ever needs to read
+/// certificates and PKCS#8 keys written by OpenSSL or rcgen.
+fn pem_blocks(bytes: &[u8], tag: &str) -> Result<Vec<Vec<u8>>> {
+    let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidCertificate)?;
+    let begin = format!("-----BEGIN {tag}-----");
+    let end = format!("-----END {tag}-----");
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(&begin) {
+        let after_begin = &rest[start + begin.len()..];
+        let Some(end_offset) = after_begin.find(&end) else {
+            return Err(Error::InvalidCertificate);
+        };
+        let body: String = after_begin[..end_offset]
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        if body.is_empty() {
+            return Err(Error::InvalidCertificate);
+        }
+        blocks.push(
+            STANDARD
+                .decode(body.as_bytes())
+                .map_err(|_| Error::InvalidCertificate)?,
+        );
+        rest = &after_begin[end_offset + end.len()..];
+    }
+    if blocks.is_empty() {
+        return Err(Error::InvalidCertificate);
+    }
+    Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    fn write_pem(path: &Path, tag: &str, der: &[u8]) {
+        let encoded = STANDARD.encode(der);
+        let mut contents = format!("-----BEGIN {tag}-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            writeln!(&mut contents, "{}", std::str::from_utf8(chunk).unwrap()).unwrap();
+        }
+        contents.push_str(&format!("-----END {tag}-----\n"));
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn pem_identity_matches_der_identity() {
+        let stem = format!(
+            "fsh-pem-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir();
+        let der_certificate = directory.join(format!("{stem}.cert"));
+        let der_key = directory.join(format!("{stem}.key"));
+        let pem_certificate = directory.join(format!("{stem}.pem.cert"));
+        let pem_key = directory.join(format!("{stem}.pem.key"));
+
+        let identity = ServerIdentity::generate(&der_certificate, &der_key).unwrap();
+        let key_der = read_private_key(&der_key).unwrap();
+        write_pem(&pem_certificate, "CERTIFICATE", identity.certificate_der());
+        write_pem(&pem_key, "PRIVATE KEY", &key_der);
+
+        let pem_identity = ServerIdentity::load(&pem_certificate, &pem_key).unwrap();
+        assert_eq!(pem_identity.pin(), identity.pin());
+
+        for path in [&der_certificate, &der_key, &pem_certificate, &pem_key] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn pem_decoder_rejects_garbage_and_unmatched_blocks() {
+        assert!(pem_blocks(b"not a pem file", "CERTIFICATE").is_err());
+        let truncated = b"-----BEGIN CERTIFICATE-----\nAAAA";
+        assert!(pem_blocks(truncated, "CERTIFICATE").is_err());
+        let invalid_base64 = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        assert!(pem_blocks(invalid_base64.as_bytes(), "CERTIFICATE").is_err());
     }
 }
