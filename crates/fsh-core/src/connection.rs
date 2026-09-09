@@ -2898,6 +2898,7 @@ fn signal_name(signal: i32) -> Option<&'static str> {
         libc::SIGPIPE => "PIPE",
         libc::SIGALRM => "ALRM",
         libc::SIGTERM => "TERM",
+        #[cfg(target_os = "linux")]
         libc::SIGSTKFLT => "STKFLT",
         libc::SIGCHLD => "CHLD",
         libc::SIGCONT => "CONT",
@@ -2912,6 +2913,7 @@ fn signal_name(signal: i32) -> Option<&'static str> {
         libc::SIGPROF => "PROF",
         libc::SIGWINCH => "WINCH",
         libc::SIGIO => "IO",
+        #[cfg(target_os = "linux")]
         libc::SIGPWR => "PWR",
         libc::SIGSYS => "SYS",
         _ => return None,
@@ -2940,6 +2942,7 @@ pub fn signal_number(name: &str) -> Option<i32> {
             "PIPE" => libc::SIGPIPE,
             "ALRM" => libc::SIGALRM,
             "TERM" => libc::SIGTERM,
+            #[cfg(target_os = "linux")]
             "STKFLT" => libc::SIGSTKFLT,
             "CHLD" => libc::SIGCHLD,
             "CONT" => libc::SIGCONT,
@@ -2954,6 +2957,7 @@ pub fn signal_number(name: &str) -> Option<i32> {
             "PROF" => libc::SIGPROF,
             "WINCH" => libc::SIGWINCH,
             "IO" => libc::SIGIO,
+            #[cfg(target_os = "linux")]
             "PWR" => libc::SIGPWR,
             "SYS" => libc::SIGSYS,
             _ => return None,
@@ -3625,6 +3629,16 @@ mod tests {
         // Unrecognized numbers stay unrecognized instead of degrading to TERM.
         assert_eq!(signal_name(64), None);
         assert_eq!(signal_number("NOTASIGNAL"), None);
+
+        // Linux-only signals must stay covered without breaking other Unix
+        // targets, where libc does not define them.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(signal_name(libc::SIGSTKFLT), Some("STKFLT"));
+            assert_eq!(signal_number("STKFLT"), Some(libc::SIGSTKFLT));
+            assert_eq!(signal_name(libc::SIGPWR), Some("PWR"));
+            assert_eq!(signal_number("PWR"), Some(libc::SIGPWR));
+        }
     }
 
     #[test]

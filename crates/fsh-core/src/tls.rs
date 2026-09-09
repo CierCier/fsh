@@ -9,7 +9,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    ServerName, UnixTime,
+};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::parse_x509_certificate;
@@ -159,47 +162,62 @@ fn host_key(host: &str, port: u16) -> String {
 }
 
 /// Server certificate and private key used by the QUIC endpoint.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ServerIdentity {
     certificate_der: Vec<u8>,
-    private_key_der: Vec<u8>,
+    private_key: PrivateKeyDer<'static>,
     pin: SpkiPin,
+}
+
+impl Clone for ServerIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            certificate_der: self.certificate_der.clone(),
+            private_key: self.private_key.clone_key(),
+            pin: self.pin,
+        }
+    }
 }
 
 impl ServerIdentity {
     pub fn load(certificate: impl AsRef<Path>, private_key: impl AsRef<Path>) -> Result<Self> {
         let certificate_der = read_certificate(certificate.as_ref())?;
-        let private_key_der = read_private_key(private_key.as_ref())?;
+        let private_key = read_private_key(private_key.as_ref())?;
         let pin = SpkiPin::from_certificate(&certificate_der)?;
         Ok(Self {
             certificate_der,
-            private_key_der,
+            private_key,
             pin,
         })
     }
 
-    pub fn generate(certificate: impl AsRef<Path>, private_key: impl AsRef<Path>) -> Result<Self> {
+    pub fn generate(
+        certificate: impl AsRef<Path>,
+        private_key_path: impl AsRef<Path>,
+    ) -> Result<Self> {
         let generated = rcgen::generate_simple_self_signed(vec!["fsh.local".to_owned()])
             .map_err(|e| Error::Protocol(format!("cannot generate server certificate: {e}")))?;
         let certificate_der = generated.cert.der().to_vec();
-        let private_key_der = generated.signing_key.serialize_der();
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            generated.signing_key.serialize_der(),
+        ));
         if let Some(parent) = certificate.as_ref().parent() {
             fs::create_dir_all(parent)?;
         }
-        if let Some(parent) = private_key.as_ref().parent() {
+        if let Some(parent) = private_key_path.as_ref().parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(certificate.as_ref(), &certificate_der)?;
-        fs::write(private_key.as_ref(), &private_key_der)?;
+        fs::write(private_key_path.as_ref(), private_key.secret_der())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(private_key.as_ref(), fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(private_key_path.as_ref(), fs::Permissions::from_mode(0o600))?;
         }
         let pin = SpkiPin::from_certificate(&certificate_der)?;
         Ok(Self {
             certificate_der,
-            private_key_der,
+            private_key,
             pin,
         })
     }
@@ -227,7 +245,7 @@ impl ServerIdentity {
     }
 
     fn private_key(&self) -> Result<PrivateKeyDer<'static>> {
-        PrivateKeyDer::try_from(self.private_key_der.clone()).map_err(|_| Error::InvalidCertificate)
+        Ok(self.private_key.clone_key())
     }
 }
 
@@ -398,23 +416,33 @@ fn read_certificate(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
-fn read_private_key(path: &Path) -> Result<Vec<u8>> {
+fn read_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let bytes = fs::read(path)?;
     if bytes.starts_with(b"-----BEGIN") {
-        // Only PKCS#8 PEM is accepted: it is what rustls-pki-types consumes
-        // and what `openssl genpkey` and rcgen emit by default.
-        pem_blocks(&bytes, "PRIVATE KEY")?
-            .into_iter()
-            .next()
-            .ok_or(Error::InvalidCertificate)
+        read_private_key_pem(&bytes)
     } else {
-        Ok(bytes)
+        // Raw DER keys are assumed to be PKCS#8, matching the previous
+        // behavior for `openssl genpkey` and rcgen output.
+        Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bytes)))
     }
 }
 
+fn read_private_key_pem(bytes: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    for tag in ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"] {
+        if let Some(der) = pem_blocks(bytes, tag)?.into_iter().next() {
+            return Ok(match tag {
+                "PRIVATE KEY" => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)),
+                "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)),
+                _ => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)),
+            });
+        }
+    }
+    Err(Error::InvalidCertificate)
+}
+
 /// Minimal RFC 7468 PEM block extraction for the given label. This replaces
-/// the unmaintained `rustls-pemfile` crate; FSH only ever needs to read
-/// certificates and PKCS#8 keys written by OpenSSL or rcgen.
+/// the unmaintained `rustls-pemfile` crate; FSH reads certificates and the
+/// PKCS#8, PKCS#1, and SEC1 private-key forms that OpenSSL and rcgen emit.
 fn pem_blocks(bytes: &[u8], tag: &str) -> Result<Vec<Vec<u8>>> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidCertificate)?;
     let begin = format!("-----BEGIN {tag}-----");
@@ -439,9 +467,6 @@ fn pem_blocks(bytes: &[u8], tag: &str) -> Result<Vec<Vec<u8>>> {
                 .map_err(|_| Error::InvalidCertificate)?,
         );
         rest = &after_begin[end_offset + end.len()..];
-    }
-    if blocks.is_empty() {
-        return Err(Error::InvalidCertificate);
     }
     Ok(blocks)
 }
@@ -480,7 +505,7 @@ mod tests {
         let identity = ServerIdentity::generate(&der_certificate, &der_key).unwrap();
         let key_der = read_private_key(&der_key).unwrap();
         write_pem(&pem_certificate, "CERTIFICATE", identity.certificate_der());
-        write_pem(&pem_key, "PRIVATE KEY", &key_der);
+        write_pem(&pem_key, "PRIVATE KEY", key_der.secret_der());
 
         let pem_identity = ServerIdentity::load(&pem_certificate, &pem_key).unwrap();
         assert_eq!(pem_identity.pin(), identity.pin());
@@ -492,10 +517,66 @@ mod tests {
 
     #[test]
     fn pem_decoder_rejects_garbage_and_unmatched_blocks() {
-        assert!(pem_blocks(b"not a pem file", "CERTIFICATE").is_err());
+        // An absent tag yields no blocks; a malformed block is an error.
+        assert!(
+            pem_blocks(b"not a pem file", "CERTIFICATE")
+                .unwrap()
+                .is_empty()
+        );
         let truncated = b"-----BEGIN CERTIFICATE-----\nAAAA";
         assert!(pem_blocks(truncated, "CERTIFICATE").is_err());
         let invalid_base64 = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
         assert!(pem_blocks(invalid_base64.as_bytes(), "CERTIFICATE").is_err());
+        let missing_end = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END OTHER-----\n";
+        assert!(pem_blocks(missing_end.as_bytes(), "CERTIFICATE").is_err());
+    }
+
+    #[test]
+    fn private_key_pem_keeps_pkcs1_and_sec1_variants() {
+        let directory = std::env::temp_dir();
+        let stem = format!(
+            "fsh-keyfmt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // The loader only unwraps PEM to DER and picks the matching variant;
+        // rustls validates the key material when the endpoint is built.
+        let pkcs1_der = vec![0x30, 0x03, 0x02, 0x01, 0x00];
+        let sec1_der = vec![0x30, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+        let pkcs1_pem = directory.join(format!("{stem}.rsa.pem"));
+        let sec1_pem = directory.join(format!("{stem}.ec.pem"));
+        write_pem(&pkcs1_pem, "RSA PRIVATE KEY", &pkcs1_der);
+        write_pem(&sec1_pem, "EC PRIVATE KEY", &sec1_der);
+
+        match read_private_key(&pkcs1_pem).unwrap() {
+            PrivateKeyDer::Pkcs1(key) => assert_eq!(key.secret_pkcs1_der(), &pkcs1_der),
+            other => panic!("expected PKCS#1 variant, got {other:?}"),
+        }
+        match read_private_key(&sec1_pem).unwrap() {
+            PrivateKeyDer::Sec1(key) => assert_eq!(key.secret_sec1_der(), &sec1_der),
+            other => panic!("expected SEC1 variant, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(&pkcs1_pem);
+        let _ = fs::remove_file(&sec1_pem);
+    }
+
+    #[test]
+    fn private_key_pem_without_known_tag_is_rejected() {
+        let directory = std::env::temp_dir();
+        let unknown = directory.join(format!(
+            "fsh-keyfmt-unknown-{}-{}.pem",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_pem(&unknown, "SOMETHING ELSE", &[1, 2, 3]);
+        assert!(read_private_key(&unknown).is_err());
+        let _ = fs::remove_file(&unknown);
     }
 }
