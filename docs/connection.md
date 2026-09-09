@@ -90,6 +90,14 @@ data-loss and mismatch path:
   and issues `RESET_STREAM` on the orphan channel stream. The client
   MUST discard the stream on receipt of `CHANNEL_OPEN_FAILURE` and
   MUST NOT send further data on it.
+- After receiving `CHANNEL_OPEN_CONFIRM`, the client MUST activate its
+  channel stream before sending channel requests by sending at least one
+  framed channel message or the stream FIN. An empty `CHANNEL_DATA`
+  message (`string data` of length zero) is the recommended activation;
+  it carries no stdin bytes. This requirement makes stream readiness
+  observable on QUIC implementations whose peer-side `accept_bi()` is
+  gated on opener data or FIN, while still preserving the rule that no
+  channel-stream bytes precede confirmation.
 - Pre-authentication quarantine: the client MUST NOT open non-zero
   streams before authentication succeeds. The server MUST issue
   `RESET_STREAM` on any non-zero stream opened before authentication
