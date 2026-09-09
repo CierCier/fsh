@@ -12,15 +12,15 @@ mod wire;
 
 pub use auth::{AuthorizedKeys, Identity, UserAuthClient, UserAuthServer};
 pub use connection::{
-    ClientSession, Command, ExitStatus, ServerSession, SessionConfig, signal_number,
+    signal_number, ClientSession, Command, ExitStatus, PtyRequest, ServerSession, SessionConfig,
 };
 pub use error::{Error, Result};
 pub use tls::{
-    ClientTransport, KnownHosts, ServerIdentity, ServerTransport, SpkiPin, make_client_endpoint,
-    make_server_endpoint,
+    make_client_endpoint, make_server_endpoint, ClientTransport, KnownHosts, ServerIdentity,
+    ServerTransport, SpkiPin,
 };
 pub use wire::{
-    Decoder, Encoder, Frame, FramedReader, FramedWriter, MAX_FRAME_SIZE, MessageNumber,
+    Decoder, Encoder, Frame, FramedReader, FramedWriter, MessageNumber, MAX_FRAME_SIZE,
 };
 
 /// The ALPN token for the v0 protocol.

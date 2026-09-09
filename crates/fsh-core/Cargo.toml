@@ -8,6 +8,7 @@ anyhow.workspace = true
 base64.workspace = true
 bytes.workspace = true
 libc.workspace = true
+portable-pty = "0.9"
 ed25519-dalek.workspace = true
 quinn.workspace = true
 quinn-proto.workspace = true

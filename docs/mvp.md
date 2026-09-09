@@ -11,8 +11,10 @@ not production remote administration or security-sensitive deployment.
 - Public-key user authentication with an OpenSSH `authorized_keys` file.
   Use an Ed25519 identity for the supported, tested path.
 - Client-initiated `session` channels over independent QUIC streams.
-- `exec` and pipe-backed `shell` requests with stdin, stdout, stderr, exit
-  status, EOF, close, and bounded cleanup handling.
+- `exec` and `shell` requests with stdin, stdout, stderr, exit
+  status, EOF, close, and bounded cleanup handling. Interactive TTY
+  shells allocate a server-side PTY (`pty-req` + `window-change`) with
+  client raw mode; non-TTY sessions stay pipe-backed.
 - `fsh` and `fshd` binaries plus serialized framing, authentication, and
   lifecycle regression tests.
 - `fcp` remains deferred and has no v0 wire protocol.

@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
 use fsh_core::{
-    ClientSession, ClientTransport, Command, ExitStatus, Identity, KnownHosts, SessionConfig,
-    SpkiPin, UserAuthClient, make_client_endpoint, signal_number,
+    ClientSession, ClientTransport, Command, ExitStatus, Identity, KnownHosts, PtyRequest,
+    SessionConfig, SpkiPin, UserAuthClient, make_client_endpoint, signal_number,
 };
 
 #[derive(Debug, Parser)]
@@ -123,12 +123,80 @@ async fn run(args: Args) -> Result<i32> {
     let mut input = tokio::io::stdin();
     let mut output = tokio::io::stdout();
     let mut error_output = tokio::io::stderr();
-    let status = session
-        .exec(command, &mut input, &mut output, &mut error_output)
-        .await
-        .context("running remote command")?;
+    // Interactive terminal plus bare `fsh host` shell: attach a pty. Every
+    // other combination (piped stdin, explicit command) keeps the existing
+    // pipe behavior byte-identical.
+    let status = if matches!(&command, Command::Shell) && io::stdin().is_terminal() {
+        run_interactive_shell(&mut session, &mut input, &mut output, &mut error_output).await?
+    } else {
+        session
+            .exec(command, &mut input, &mut output, &mut error_output)
+            .await
+            .context("running remote command")?
+    };
 
     exit_status_code(status)
+}
+
+/// Run a shell attached to a server-side pty: raw local tty, `pty-req` with
+/// the current `TERM`/winsize before the shell request, and `window-change`
+/// updates on resize. A refused `pty-req` falls back to a pipe shell.
+async fn run_interactive_shell(
+    session: &mut ClientSession,
+    input: &mut tokio::io::Stdin,
+    stdout: &mut tokio::io::Stdout,
+    stderr: &mut tokio::io::Stderr,
+) -> Result<ExitStatus> {
+    // Raw mode for the whole session; the guard restores termios on return.
+    let _raw = enable_raw_mode();
+    let term = client_term();
+    let (cols, rows) = pty_size();
+    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel::<(u32, u32)>(8);
+    // Resize poller: re-check the winsize each iteration (immediately, then
+    // every second) and forward changes; exits when the session drops the
+    // receiver or the session ends.
+    let poller = tokio::spawn(async move {
+        let mut last = (cols, rows);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Some(size) = terminal_winsize()
+                && size != last
+            {
+                last = size;
+                if resize_tx.send(size).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let result = session
+        .exec_pty(
+            Command::Shell,
+            PtyRequest { term, cols, rows },
+            resize_rx,
+            input,
+            stdout,
+            stderr,
+        )
+        .await;
+    poller.abort();
+    let _ = poller.await;
+    match result {
+        Ok(status) => Ok(status),
+        Err(fsh_core::Error::Command(_)) => {
+            // The server refused the pty: restore canonical mode first so the
+            // fallback behaves exactly like the historical pipe shell.
+            drop(_raw);
+            eprintln!("fsh: server refused pty allocation; falling back to pipe");
+            session
+                .exec(Command::Shell, input, stdout, stderr)
+                .await
+                .context("running remote command")
+        }
+        Err(error) => Err(error).context("running remote command"),
+    }
+
 }
 
 async fn connect_session(
@@ -265,6 +333,149 @@ fn requested_command(args: &Args) -> Command {
     }
 }
 
+// Interactive-shell TTY support. Used only when stdin is a terminal and the
+// request is `Command::Shell` (bare `fsh host`); pipe and explicit-command
+// paths never call these.
+
+/// Linux `struct termios` (glibc layout).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; 32],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+// Direct libc syscalls only (no TUI crate): raw mode needs TCGETS/TCSETS and
+// resize polling needs TIOCGWINSZ, none of which `std` exposes.
+unsafe extern "C" {
+    fn ioctl(
+        fd: std::os::raw::c_int,
+        request: std::os::raw::c_ulong,
+        ...
+    ) -> std::os::raw::c_int;
+}
+
+const TCGETS: std::os::raw::c_ulong = 0x5401;
+const TCSETS: std::os::raw::c_ulong = 0x5402;
+const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+
+/// Apply the `cfmakeraw` equivalent: no line buffering or echo, no
+/// `ISIG`/`IXON` handling, 8-bit clean, `read` returns after 1 byte.
+/// Signal generation stays off so bytes like `0x03` (Ctrl-C) travel to the
+/// server pty, whose kernel delivers `SIGINT` to the remote foreground.
+fn make_raw(termios: &mut Termios) {
+    // iflag: INBRK | BRKINT | ISTRIP | ICRNL | IXON
+    termios.c_iflag &= !(0x1 | 0x2 | 0x20 | 0x100 | 0x400);
+    // oflag: OPOST
+    termios.c_oflag &= !0x1;
+    // cflag: clear CSIZE | PARENB, then set CS8
+    termios.c_cflag &= !(0x30 | 0x100);
+    termios.c_cflag |= 0x30;
+    // lflag: ECHO | ICANON | IEXTEN | ISIG
+    termios.c_lflag &= !(0x8 | 0x2 | 0x8000 | 0x100);
+    // VMIN = 1, VTIME = 0
+    termios.c_cc[6] = 1;
+    termios.c_cc[5] = 0;
+}
+
+/// Restores the saved termios for every fd it changed when dropped.
+struct RawGuard {
+    saved: Vec<(std::os::raw::c_int, Termios)>,
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        for (fd, saved) in &self.saved {
+            // Best effort: nothing useful to do with a failure while exiting.
+            unsafe {
+                ioctl(*fd, TCSETS, saved);
+            }
+        }
+    }
+}
+
+/// Put stdin/stdout into raw mode wherever they are terminals. Fds that are
+/// not terminals (pipes, redirects) are left untouched.
+fn enable_raw_mode() -> Option<RawGuard> {
+    let mut saved = Vec::new();
+    for fd in [0, 1] {
+        let mut current: Termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `TCGETS` only writes `struct termios` when `fd` is a
+        // terminal; otherwise it fails and `current` stays untouched.
+        if unsafe { ioctl(fd, TCGETS, &mut current) } != 0 {
+            continue;
+        }
+        let mut raw = current;
+        make_raw(&mut raw);
+        // SAFETY: `raw` is a valid `struct termios` derived from this fd.
+        if unsafe { ioctl(fd, TCSETS, &raw) } != 0 {
+            continue;
+        }
+        saved.push((fd, current));
+    }
+    if saved.is_empty() {
+        None
+    } else {
+        Some(RawGuard { saved })
+    }
+}
+
+/// Current terminal size, clamped to the `pty-req` wire bounds. Prefers
+/// stdin (the tty that gates interactive mode), falls back to stdout.
+fn terminal_winsize() -> Option<(u32, u32)> {
+    let mut size = Winsize::default();
+    // SAFETY: `TIOCGWINSZ` only writes `struct winsize` on success.
+    let ok = unsafe { ioctl(0, TIOCGWINSZ, &mut size) } == 0
+        || unsafe { ioctl(1, TIOCGWINSZ, &mut size) } == 0;
+    if !ok || (size.ws_col == 0 && size.ws_row == 0) {
+        return None;
+    }
+    Some((clamp_dim(size.ws_col), clamp_dim(size.ws_row)))
+}
+
+fn clamp_dim(value: u16) -> u32 {
+    (value as u32).clamp(1, 1024)
+}
+
+fn pty_size() -> (u32, u32) {
+    terminal_winsize().unwrap_or((80, 24))
+}
+
+fn client_term() -> String {
+    sanitize_term(&env::var("TERM").unwrap_or_default())
+}
+
+/// Clamp `TERM` to the wire contract: 1-64 printable ASCII chars, defaulting
+/// to `xterm-256color` when nothing usable remains.
+fn sanitize_term(value: &str) -> String {
+    let term: String = value
+        .bytes()
+        .filter(|byte| (0x20..=0x7E).contains(byte))
+        .take(64)
+        .map(char::from)
+        .collect();
+    if term.is_empty() {
+        String::from("xterm-256color")
+    } else {
+        term
+    }
+}
+
 fn shell_quote(argument: &str) -> String {
     if argument.is_empty() {
         "''".to_owned()
@@ -393,4 +604,42 @@ mod tests {
         };
         assert_eq!(exit_status_code(status).unwrap(), 1);
     }
+
+    #[test]
+    fn term_defaults_when_empty_or_unusable() {
+        assert_eq!(sanitize_term(""), "xterm-256color");
+        assert_eq!(sanitize_term("\u{0}\u{1b}[31m"), "[31m");
+        assert_eq!(sanitize_term("xterm-256color"), "xterm-256color");
+    }
+
+    #[test]
+    fn term_truncates_to_wire_limit() {
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_term(&long), "a".repeat(64));
+    }
+
+    #[test]
+    fn winsize_dims_stay_in_wire_bounds() {
+        assert_eq!(clamp_dim(0), 1);
+        assert_eq!(clamp_dim(80), 80);
+        assert_eq!(clamp_dim(5000), 1024);
+    }
+
+    #[test]
+    fn make_raw_clears_canonical_mode_and_echo() {
+        let mut termios: Termios = unsafe { std::mem::zeroed() };
+        termios.c_iflag = 0xffff;
+        termios.c_oflag = 0xffff;
+        termios.c_cflag = 0xffff;
+        termios.c_lflag = 0xffff;
+        make_raw(&mut termios);
+        // ICANON | ECHO | ISIG | IEXTEN cleared.
+        assert_eq!(termios.c_lflag & (0x2 | 0x8 | 0x100 | 0x8000), 0);
+        // OPOST cleared; CS8 set.
+        assert_eq!(termios.c_oflag & 0x1, 0);
+        assert_eq!(termios.c_cflag & 0x30, 0x30);
+        assert_eq!(termios.c_cc[6], 1);
+        assert_eq!(termios.c_cc[5], 0);
+    }
+
 }

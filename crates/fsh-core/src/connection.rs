@@ -20,6 +20,7 @@ use tokio::{
 use crate::auth::UserAuthClient;
 use crate::wire::{Decoder, Encoder, Frame, FramedReader, FramedWriter, MAX_FRAME_SIZE, WireError};
 use crate::{Error, Result};
+use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 
 pub const MSG_GLOBAL_REQUEST: u8 = 80;
 pub const MSG_REQUEST_SUCCESS: u8 = 81;
@@ -53,6 +54,12 @@ const MAX_PENDING_CHANNEL_REQUESTS: usize = 16;
 type ControlWriter = Arc<Mutex<FramedWriter<quinn::SendStream>>>;
 type IncomingChannelStream = (quinn::SendStream, quinn::RecvStream);
 type ChannelStream = (quinn::SendStream, FramedReader<quinn::RecvStream>);
+type PtySetup = (
+    Box<dyn portable_pty::MasterPty + Send>,
+    Box<dyn std::io::Read + Send>,
+    Box<dyn std::io::Write + Send>,
+    u32,
+);
 
 struct PendingGlobalGuard {
     pending: Arc<AtomicBool>,
@@ -109,6 +116,16 @@ struct CleanupPolicy {
     input_done: bool,
     deliver_data: bool,
 }
+struct RequestBindingParams<'a, W, E> {
+    channel_id: u32,
+    active: &'a mut ActiveChannelGuard,
+    data_writer: FramedWriter<quinn::SendStream>,
+    data_reader: FramedReader<quinn::RecvStream>,
+    payload: Vec<u8>,
+    rejection: &'a str,
+    stdout: &'a mut W,
+    stderr: &'a mut E,
+}
 
 impl ClientControlReader {
     async fn next(&self) -> std::result::Result<Option<Frame>, WireError> {
@@ -156,6 +173,51 @@ pub enum ExitStatus {
         core_dumped: bool,
         message: String,
     },
+}
+/// A terminal allocation requested alongside a `shell` or `exec` binding.
+/// The client sends `pty-req` with these dimensions before the binding
+/// request; pixel dimensions are always unspecified (0) and the mode list
+/// is always empty in v1.
+#[derive(Clone, Debug)]
+pub struct PtyRequest {
+    pub term: String,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+fn valid_term(term: &str) -> bool {
+    !term.is_empty()
+        && term.len() <= 64
+        && term.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
+
+fn valid_pty_dims(cols: u32, rows: u32) -> bool {
+    (1..=1024).contains(&cols) && (1..=1024).contains(&rows)
+}
+/// Parse-validate the SSH-encoded terminal modes from `pty-req` (RFC 4254
+/// section 8: opcode bytes each followed by a u32 value, terminated by
+/// `TTY_OP_END`).
+///
+/// v1 limitation: the modes are validated only. Nothing except the window
+/// size is applied to the allocated pty; the kernel pty defaults stay in
+/// effect.
+fn validate_pty_modes(modes: &[u8]) -> bool {
+    if modes.is_empty() {
+        return true;
+    }
+    let mut pos = 0;
+    while pos < modes.len() {
+        let opcode = modes[pos];
+        pos += 1;
+        if opcode == 0 {
+            return pos == modes.len();
+        }
+        if pos + 4 > modes.len() {
+            return false;
+        }
+        pos += 4;
+    }
+    false
 }
 
 /// An authenticated client-side FSH connection.
@@ -355,6 +417,39 @@ impl ClientSession {
         result
     }
 
+    /// Execute one session channel with a terminal allocated first. The
+    /// client sends `pty-req` before the program binding, relays DATA frames
+    /// exactly like [`ClientSession::exec`], and forwards each `resize`
+    /// event as a `window-change` request (invalid sizes are ignored).
+    /// A refused `pty-req` closes the channel through the normal EOF/FIN
+    /// path and returns `Error::Command`, so the caller can fall back to
+    /// plain [`ClientSession::exec`].
+    pub async fn exec_pty<R, W, E>(
+        &mut self,
+        command: Command,
+        pty: PtyRequest,
+        resize: mpsc::Receiver<(u32, u32)>,
+        input: &mut R,
+        stdout: &mut W,
+        stderr: &mut E,
+    ) -> Result<ExitStatus>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
+        if !valid_term(&pty.term) || !valid_pty_dims(pty.cols, pty.rows) {
+            return Err(Error::Command("invalid pty request".into()));
+        }
+        let result = self
+            .exec_pty_inner(command, pty, resize, input, stdout, stderr)
+            .await;
+        if matches!(&result, Err(Error::Protocol(_)) | Err(Error::Wire(_))) {
+            self.abort_protocol("connection protocol error").await;
+        }
+        result
+    }
+
     async fn exec_inner<R, W, E>(
         &mut self,
         command: Command,
@@ -367,6 +462,95 @@ impl ClientSession {
         W: AsyncWrite + Unpin,
         E: AsyncWrite + Unpin,
     {
+        let (channel_id, mut active, data_writer, data_reader) =
+            self.open_channel_stream().await?;
+        let payload = encode_channel_request(channel_id, &command)?;
+        let (data_writer, data_reader) = self
+            .request_binding(RequestBindingParams {
+                channel_id,
+                active: &mut active,
+                data_writer,
+                data_reader,
+                payload,
+                rejection: "remote rejected channel request",
+                stdout,
+                stderr,
+            })
+            .await?;
+        self.run_channel_loop(
+            channel_id, active, data_writer, data_reader, input, stdout, stderr, None,
+        )
+        .await
+    }
+
+    async fn exec_pty_inner<R, W, E>(
+        &mut self,
+        command: Command,
+        pty: PtyRequest,
+        resize: mpsc::Receiver<(u32, u32)>,
+        input: &mut R,
+        stdout: &mut W,
+        stderr: &mut E,
+    ) -> Result<ExitStatus>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
+        let (channel_id, mut active, data_writer, data_reader) =
+            self.open_channel_stream().await?;
+        // The pty must be allocated before the program binding: a pipe
+        // worker started first can never gain a terminal later.
+        let payload = encode_pty_request(channel_id, &pty.term, pty.cols, pty.rows);
+        let (data_writer, data_reader) = self
+            .request_binding(RequestBindingParams {
+                channel_id,
+                active: &mut active,
+                data_writer,
+                data_reader,
+                payload,
+                rejection: "remote rejected pty request",
+                stdout,
+                stderr,
+            })
+            .await?;
+        let payload = encode_channel_request(channel_id, &command)?;
+        let (data_writer, data_reader) = self
+            .request_binding(RequestBindingParams {
+                channel_id,
+                active: &mut active,
+                data_writer,
+                data_reader,
+                payload,
+                rejection: "remote rejected channel request",
+                stdout,
+                stderr,
+            })
+            .await?;
+        self.run_channel_loop(
+            channel_id,
+            active,
+            data_writer,
+            data_reader,
+            input,
+            stdout,
+            stderr,
+            Some(resize),
+        )
+        .await
+    }
+
+    /// Open a channel stream, confirm it, and activate it with the empty
+    /// DATA handshake both `exec` and `exec_pty` need before any binding
+    /// request.
+    async fn open_channel_stream(
+        &mut self,
+    ) -> Result<(
+        u32,
+        ActiveChannelGuard,
+        FramedWriter<quinn::SendStream>,
+        FramedReader<quinn::RecvStream>,
+    )> {
         let (data_send, data_recv) = self.connection.open_bi().await?;
         let stream_id = data_send.id();
         if stream_id.index() == 0
@@ -379,7 +563,7 @@ impl ClientSession {
         let channel_id = stream_id.index() as u32;
         let mut active = self.begin_channel_activity()?;
         let mut data_writer = FramedWriter::new(data_send);
-        let mut data_reader = FramedReader::new(data_recv);
+        let data_reader = FramedReader::new(data_recv);
 
         send_control(
             &self.control_writer,
@@ -401,12 +585,35 @@ impl ClientSession {
         data_writer
             .send(MSG_CHANNEL_DATA, &encode_channel_data(channel_id, &[])?)
             .await?;
-        send_control(
-            &self.control_writer,
-            MSG_CHANNEL_REQUEST,
-            encode_channel_request(channel_id, &command)?,
-        )
-        .await?;
+        Ok((channel_id, active, data_writer, data_reader))
+    }
+
+    /// Send one binding request (`pty-req`, `shell`, `exec`) and await its
+    /// reply. On CHANNEL_FAILURE the already-open channel stream is closed
+    /// through the normal EOF/FIN path and `rejection` is returned, so the
+    /// caller can tell which request the peer refused.
+    async fn request_binding<W, E>(
+        &mut self,
+        params: RequestBindingParams<'_, W, E>,
+    ) -> Result<(
+        FramedWriter<quinn::SendStream>,
+        FramedReader<quinn::RecvStream>,
+    )>
+    where
+        W: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
+        let RequestBindingParams {
+            channel_id,
+            active,
+            data_writer,
+            data_reader,
+            payload,
+            rejection,
+            stdout,
+            stderr,
+        } = params;
+        send_control(&self.control_writer, MSG_CHANNEL_REQUEST, payload).await?;
         if let Err(error) = self.await_channel_success(channel_id).await {
             if matches!(error, Error::Command(_)) {
                 // CHANNEL_FAILURE rejects the binding, not the already-open
@@ -440,9 +647,35 @@ impl ClientSession {
                 drop(data_reader.into_inner());
             }
             self.closed_channels.insert(channel_id);
+            if matches!(error, Error::Command(_)) {
+                return Err(Error::Command(rejection.into()));
+            }
             return Err(error);
         }
+        Ok((data_writer, data_reader))
+    }
 
+    /// Relay stdin/stdout/stderr and control traffic for one bound channel
+    /// until both sides have closed. `pty_resize` carries terminal resizes
+    /// for `exec_pty` sessions; `exec` passes `None` and behaves exactly as
+    /// before.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_channel_loop<R, W, E>(
+        &mut self,
+        channel_id: u32,
+        mut active: ActiveChannelGuard,
+        mut data_writer: FramedWriter<quinn::SendStream>,
+        mut data_reader: FramedReader<quinn::RecvStream>,
+        input: &mut R,
+        stdout: &mut W,
+        stderr: &mut E,
+        mut pty_resize: Option<mpsc::Receiver<(u32, u32)>>,
+    ) -> Result<ExitStatus>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+        E: AsyncWrite + Unpin,
+    {
         let mut input_done = false;
         let mut output_fin = false;
         let mut peer_close = false;
@@ -493,6 +726,30 @@ impl ClientSession {
                     } else {
                         let payload = encode_channel_data(channel_id, &input_buffer[..length])?;
                         data_writer.send(MSG_CHANNEL_DATA, &payload).await?;
+                    }
+                }
+                resized = async {
+                    if let Some(resize) = pty_resize.as_mut() {
+                        resize.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    match resized {
+                        Some((cols, rows)) if valid_pty_dims(cols, rows) => {
+                            send_control(
+                                &self.control_writer,
+                                MSG_CHANNEL_REQUEST,
+                                encode_window_change(channel_id, cols, rows, false),
+                            )
+                            .await?;
+                        }
+                        // A closed resize feed or an invalid size ends
+                        // polling; either way the session itself continues.
+                        None => {
+                            pty_resize = None;
+                        }
+                        Some(_) => {}
                     }
                 }
                 frame = data_reader.next(), if !output_fin => {
@@ -1818,6 +2075,7 @@ struct ServerChannel {
     activation_handle: Option<tokio::task::JoinHandle<()>>,
     pending_data: VecDeque<Vec<u8>>,
     command: Option<Command>,
+    pty: Option<PtyConfig>,
     pending_requests: VecDeque<ChannelRequest>,
     worker_tx: Option<mpsc::Sender<WorkerCommand>>,
     worker_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1855,6 +2113,7 @@ impl ServerChannel {
             activation_handle: None,
             pending_data: VecDeque::new(),
             command: None,
+            pty: None,
             pending_requests: VecDeque::new(),
             worker_tx: None,
             worker_handle: None,
@@ -1898,7 +2157,19 @@ impl Drop for ServerChannel {
 enum WorkerCommand {
     Signal(String),
     ControlEof,
+    WindowChange { cols: u32, rows: u32 },
     Close,
+}
+/// The accepted `pty-req` dimensions stored per channel. The window size is
+/// applied to the kernel pty at allocation and on every `window-change`;
+/// nothing else from the request is applied (see `validate_pty_modes`).
+#[derive(Clone, Debug)]
+struct PtyConfig {
+    term: String,
+    cols: u32,
+    rows: u32,
+    width: u32,
+    height: u32,
 }
 
 enum WorkerEvent {
@@ -2146,6 +2417,7 @@ async fn maybe_start_worker(
         return Ok(());
     }
     let command = state.command.clone().expect("command checked");
+    let pty = state.pty.clone();
     let (send, recv) = state.stream.take().expect("stream checked");
     let initial_data = state.pending_data.drain(..).collect::<Vec<_>>();
     state.stream_deadline = None;
@@ -2166,6 +2438,7 @@ async fn maybe_start_worker(
         let result = run_channel_worker(
             id,
             command,
+            pty,
             send,
             recv,
             initial_data,
@@ -2301,8 +2574,28 @@ async fn handle_server_channel_request(
         ChannelRequestKind::Subsystem(name) => {
             let _ = name;
         }
-        ChannelRequestKind::Pty { valid } => {
-            let _ = valid;
+        ChannelRequestKind::Pty {
+            term,
+            cols,
+            rows,
+            width,
+            height,
+            valid,
+        } => {
+            // One pty per channel at most, and only before a pipe worker
+            // exists: a running pipe worker can never gain a terminal.
+            let worker_running =
+                state.worker_handle.is_some() || state.worker_tx.is_some();
+            if valid && state.pty.is_none() && !worker_running {
+                state.pty = Some(PtyConfig {
+                    term,
+                    cols,
+                    rows,
+                    width,
+                    height,
+                });
+                success = request.want_reply;
+            }
         }
         ChannelRequestKind::Signal(signal) => {
             if valid_signal(&signal) {
@@ -2315,8 +2608,28 @@ async fn handle_server_channel_request(
                 }
             }
         }
-        ChannelRequestKind::WindowChange { valid } => {
-            let _ = valid;
+        ChannelRequestKind::WindowChange {
+            cols,
+            rows,
+            valid,
+            ..
+        } => {
+            if !valid || state.pty.is_none() {
+                // Invalid sizes and channels without a pty are ignored.
+            } else if let Some(tx) = &state.worker_tx {
+                // A live pty worker owns the master side; forward the new
+                // size so it can ioctl the kernel winsize.
+                let _ = tx
+                    .send(WorkerCommand::WindowChange { cols, rows })
+                    .await;
+                success = request.want_reply;
+            } else if let Some(pty) = state.pty.as_mut() {
+                // No worker yet: resize the pending allocation so the
+                // worker spawns with the latest size.
+                pty.cols = cols;
+                pty.rows = rows;
+                success = request.want_reply;
+            }
         }
         ChannelRequestKind::ExitStatus | ChannelRequestKind::ExitSignal => {}
     }
@@ -2345,6 +2658,7 @@ struct WorkerOutcome {
 async fn run_channel_worker(
     channel_id: u32,
     command: Command,
+    pty: Option<PtyConfig>,
     send: quinn::SendStream,
     recv: FramedReader<quinn::RecvStream>,
     initial_data: Vec<Vec<u8>>,
@@ -2354,6 +2668,22 @@ async fn run_channel_worker(
     login_shell: Option<String>,
     close_timeout: Duration,
 ) -> Result<WorkerOutcome> {
+    if let Some(pty) = pty {
+        return run_pty_channel_worker(
+            channel_id,
+            command,
+            pty,
+            send,
+            recv,
+            initial_data,
+            control_writer,
+            commands,
+            events,
+            login_shell,
+            close_timeout,
+        )
+        .await;
+    }
     let mut process = match spawn_process(&command, login_shell.as_deref()) {
         Ok(process) => process,
         Err(_error) => {
@@ -2482,6 +2812,9 @@ async fn run_channel_worker(
                             );
                         }
                     }
+                    // Pipe workers own no pty; a resize can never reach
+                    // them (the handler only forwards to pty channels).
+                    Some(WorkerCommand::WindowChange { .. }) => {}
                     None => {}
                 }
             }
@@ -2588,7 +2921,9 @@ async fn run_channel_worker(
                     match command {
                         Some(WorkerCommand::ControlEof) => {}
                         Some(WorkerCommand::Close) => {}
-                        Some(WorkerCommand::Signal(_)) | None => {}
+                        Some(WorkerCommand::Signal(_))
+                        | Some(WorkerCommand::WindowChange { .. })
+                        | None => {}
                     }
                 }
                 event = io_rx.recv() => {
@@ -2646,6 +2981,401 @@ async fn run_channel_worker(
         });
     }
     while tasks.join_next().await.is_some() {}
+    Ok(WorkerOutcome {
+        failed: closing && !close_requested,
+        peer_fin: input_fin,
+        local_fin,
+    })
+}
+fn pty_size(pty: &PtyConfig) -> PtySize {
+    PtySize {
+        rows: pty.rows as u16,
+        cols: pty.cols as u16,
+        pixel_width: pty.width as u16,
+        pixel_height: pty.height as u16,
+    }
+}
+
+/// Build the terminal command for a pty worker: the same program and
+/// environment policy as [`spawn_process`], plus `TERM` from the accepted
+/// `pty-req`.
+fn pty_command_builder(
+    command: &Command,
+    login_shell: Option<&str>,
+    term: &str,
+) -> Result<PtyCommandBuilder> {
+    let (program, args) = match command {
+        Command::Exec(command) => {
+            let words = shell_words::split(command)
+                .map_err(|e| Error::Command(format!("invalid command quoting: {e}")))?;
+            if words.is_empty() {
+                return Err(Error::Command("empty command".into()));
+            }
+            (words[0].clone(), words[1..].to_vec())
+        }
+        // With a pty attached the shell detects the terminal itself and runs
+        // interactively; it is started without `-c` and without extra flags.
+        Command::Shell => (resolve_shell(login_shell), Vec::new()),
+    };
+    let account = account_info();
+    let mut builder = PtyCommandBuilder::new(&program);
+    builder.args(&args);
+    builder.env_clear();
+    builder.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    builder.env("TERM", term);
+    if let Some(account) = &account {
+        let shell = resolve_shell(login_shell);
+        builder.env("HOME", &account.home);
+        builder.env("SHELL", &shell);
+        builder.env("USER", &account.name);
+        builder.env("LOGNAME", &account.name);
+        builder.env("PWD", &account.home);
+    }
+    Ok(builder)
+}
+
+/// Run a channel whose program is attached to a pty slave: stdin, stdout,
+/// and stderr all go through the terminal. Master bytes are relayed as
+/// channel DATA frames; exit-status, EOF, FIN, and CLOSE keep the same
+/// order and drain rules as the pipe worker.
+#[allow(clippy::too_many_arguments)]
+async fn run_pty_channel_worker(
+    channel_id: u32,
+    command: Command,
+    pty: PtyConfig,
+    send: quinn::SendStream,
+    recv: FramedReader<quinn::RecvStream>,
+    initial_data: Vec<Vec<u8>>,
+    control_writer: ControlWriter,
+    mut commands: mpsc::Receiver<WorkerCommand>,
+    events: mpsc::UnboundedSender<WorkerEvent>,
+    login_shell: Option<String>,
+    close_timeout: Duration,
+) -> Result<WorkerOutcome> {
+    // Allocate the pty and spawn the command before touching the channel
+    // stream, so a setup failure follows the same 127/exit-status path as a
+    // rejected pipe command.
+    let setup = (|| -> Result<PtySetup> {
+        let builder = pty_command_builder(&command, login_shell.as_deref(), &pty.term)?;
+        let pair = native_pty_system()
+            .openpty(pty_size(&pty))
+            .map_err(|e| Error::Command(format!("cannot allocate pty: {e}")))?;
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(|e| Error::Command(format!("cannot start command: {e}")))?;
+        let pid = child
+            .process_id()
+            .ok_or_else(|| Error::Command("child has no process id".into()))?;
+        let reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                send_process_signal(pid, "KILL");
+                return Err(Error::Command(format!("cannot read pty: {error}")));
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                send_process_signal(pid, "KILL");
+                return Err(Error::Command(format!("cannot write pty: {error}")));
+            }
+        };
+        // The std handle is dropped here on purpose: the pid is reaped
+        // below with a dedicated waitpid, which is safe alongside tokio
+        // (its reaper only waits on pids it spawned itself). Dropping the
+        // handle does not signal the child; cleanup stays with the process
+        // group guard and the explicit kills.
+        drop(child);
+        Ok((pair.master, reader, writer, pid))
+    })();
+    let (master, pty_reader, pty_writer, process_id) = match setup {
+        Ok(setup) => setup,
+        Err(_error) => {
+            let mut exit = Encoder::new();
+            exit.u32(channel_id);
+            exit.string("exit-status")?;
+            exit.boolean(false);
+            exit.u32(127);
+            let _ = send_control(&control_writer, MSG_CHANNEL_REQUEST, exit.finish()).await;
+            let _ = send_control(
+                &control_writer,
+                MSG_CHANNEL_EOF,
+                encode_channel_id(channel_id),
+            )
+            .await;
+            let mut output_writer = FramedWriter::new(send);
+            let local_fin = output_writer.finish().await.is_ok();
+            let peer_fin = drain_input_until_fin(recv, close_timeout).await;
+            return Ok(WorkerOutcome {
+                failed: true,
+                peer_fin,
+                local_fin,
+            });
+        }
+    };
+    let mut process_guard = ProcessGroupGuard::new(process_id);
+    let mut output_writer = FramedWriter::new(send);
+    let (io_tx, mut io_rx) = mpsc::channel::<WorkerIo>(64);
+    let input_task = tokio::spawn(read_channel_input(
+        channel_id,
+        recv,
+        initial_data,
+        close_timeout,
+        io_tx.clone(),
+    ));
+    let output_tx = io_tx.clone();
+    let output_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut reader = pty_reader;
+        let mut buffer = vec![0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(length) => {
+                    if output_tx
+                        .blocking_send(WorkerIo::Output(
+                            StreamKind::Stdout,
+                            buffer[..length].to_vec(),
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = output_tx.blocking_send(WorkerIo::OutputDone);
+    });
+    // The writer task owns the master writer for the whole session. Stdin
+    // EOF from the channel must NOT close it early: the pty line discipline
+    // turns in-band ^D into EOF for the foreground job on its own. The
+    // writer is released only when the worker ends, i.e. when the channel
+    // fully closes.
+    let (pty_stdin_tx, pty_stdin_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let writer_task = tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut writer = pty_writer;
+        while let Ok(data) = pty_stdin_rx.recv() {
+            if writer.write_all(&data).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+    drop(io_tx);
+
+    // Reap the pty leader with a dedicated blocking waitpid on its exact
+    // pid. This is safe alongside tokio workers: the runtime reaper only
+    // waits on pids it spawned itself, never with waitpid(-1).
+    let mut wait = tokio::task::spawn_blocking(move || -> std::io::Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+        loop {
+            let mut raw: libc::c_int = 0;
+            let reaped = unsafe { libc::waitpid(process_id as libc::pid_t, &mut raw, 0) };
+            if reaped == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Ok(std::process::ExitStatus::from_raw(raw));
+        }
+    });
+    let mut process_status = None;
+    let mut input_done = false;
+    let mut input_fin = false;
+    let mut output_done = 0u8;
+    let mut sent_exit = false;
+    let mut closing = false;
+    let mut protocol_error = false;
+    let mut io_closed = false;
+    let mut close_requested = false;
+    let mut close_kill_deadline = None;
+
+    loop {
+        if output_done >= 1 && process_status.is_some() {
+            break;
+        }
+        tokio::select! {
+            _ = async {
+                if let Some(deadline) = close_kill_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if close_kill_deadline.is_some() && !closing && process_status.is_none() => {
+                closing = true;
+                close_kill_deadline = None;
+                send_process_signal(process_id, "KILL");
+            }
+            status = &mut wait, if process_status.is_none() => {
+                let status = status
+                    .map_err(|error| Error::Command(format!("wait failed: {error}")))?
+                    .map_err(|error| Error::Command(format!("wait failed: {error}")))?;
+                process_status = Some(status);
+                // The pty child establishes its own session, so its pid is
+                // the process group: terminate descendants with the leader
+                // so background jobs cannot outlive the channel.
+                send_process_signal(process_id, "KILL");
+                process_guard.disarm();
+            }
+            command = commands.recv() => {
+                match command {
+                    Some(WorkerCommand::Signal(signal)) => { send_process_signal(process_id, &signal); }
+                    // Stdin EOF from the channel never closes the master;
+                    // keep relaying until the channel itself closes.
+                    Some(WorkerCommand::ControlEof) => {}
+                    Some(WorkerCommand::WindowChange { cols, rows }) => {
+                        let _ = master.resize(PtySize {
+                            rows: rows as u16,
+                            cols: cols as u16,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    Some(WorkerCommand::Close) => {
+                        close_requested = true;
+                        if process_status.is_none() {
+                            close_kill_deadline = Some(
+                                tokio::time::Instant::now() + CLOSE_DRAIN_GRACE,
+                            );
+                        }
+                    }
+                    None => {}
+                }
+            }
+            event = io_rx.recv(), if !io_closed => {
+                match event {
+                    Some(WorkerIo::Input(data)) => {
+                        if pty_stdin_tx.send(data).is_ok() {
+                            let _ = events.send(WorkerEvent::InputProgress { id: channel_id });
+                        }
+                    }
+                    Some(WorkerIo::InputDone { clean, fin }) => {
+                        input_done = clean;
+                        input_fin = fin;
+                        if !clean {
+                            protocol_error = true;
+                            closing = true;
+                            if process_status.is_none() {
+                                send_process_signal(process_id, "KILL");
+                            }
+                        }
+                    }
+                    Some(WorkerIo::Output(kind, data)) if !protocol_error => {
+                        let mut encoder = Encoder::new();
+                        encoder.u32(channel_id);
+                        if kind == StreamKind::Stderr {
+                            encoder.u32(STDERR_TYPE);
+                        }
+                        encoder.bytes(&data)?;
+                        output_writer.send(if kind == StreamKind::Stderr { MSG_CHANNEL_EXTENDED_DATA } else { MSG_CHANNEL_DATA }, &encoder.finish()).await?;
+                    }
+                    Some(WorkerIo::Output(_, _)) => {}
+                    Some(WorkerIo::OutputDone) => {
+                        output_done = output_done.saturating_add(1);
+                    }
+                    Some(WorkerIo::ProtocolError) => {
+                        protocol_error = true;
+                        closing = true;
+                        if process_status.is_none() {
+                            send_process_signal(process_id, "KILL");
+                        }
+                    }
+                    None => {
+                        io_closed = true;
+                    }
+                }
+            }
+        }
+        if !closing
+            && !sent_exit
+            && let Some(status) = process_status.as_ref()
+        {
+            send_exit_notification(&control_writer, channel_id, status).await?;
+            sent_exit = true;
+        }
+    }
+
+    if !sent_exit && let Some(status) = process_status.as_ref() {
+        send_exit_notification(&control_writer, channel_id, status).await?;
+    }
+    send_control(
+        &control_writer,
+        MSG_CHANNEL_EOF,
+        encode_channel_id(channel_id),
+    )
+    .await?;
+    let local_fin = output_writer.finish().await.is_ok();
+
+    // The pty has no half-close: stdin EOF arrived (or not) without closing
+    // the master, so drain the input reader until the peer FIN or timeout.
+    drop(pty_stdin_tx);
+    if !input_done {
+        let deadline_at = tokio::time::Instant::now() + close_timeout;
+        let deadline = tokio::time::sleep_until(deadline_at);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    protocol_error = true;
+                    break;
+                }
+                command = commands.recv() => {
+                    match command {
+                        Some(WorkerCommand::ControlEof) => {}
+                        Some(WorkerCommand::Close) => {}
+                        Some(WorkerCommand::Signal(_))
+                        | Some(WorkerCommand::WindowChange { .. })
+                        | None => {}
+                    }
+                }
+                event = io_rx.recv() => {
+                    match event {
+                        Some(WorkerIo::Input(_)) => {
+                            // The child is gone; late input is discarded but
+                            // still extends the drain window like a pipe.
+                            deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + close_timeout);
+                        }
+                        Some(WorkerIo::InputDone { clean, fin }) => {
+                            input_fin = fin;
+                            if !clean {
+                                protocol_error = true;
+                            }
+                            break;
+                        }
+                        Some(WorkerIo::ProtocolError) => {
+                            protocol_error = true;
+                        }
+                        Some(WorkerIo::Output(_, _)) | Some(WorkerIo::OutputDone) => {}
+                        None => {
+                            protocol_error = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if protocol_error {
+        input_task.abort();
+    }
+    let _ = input_task.await;
+    let _ = output_task.await;
+    let _ = writer_task.await;
+    if protocol_error {
+        return Ok(WorkerOutcome {
+            failed: true,
+            peer_fin: input_fin,
+            local_fin,
+        });
+    }
     Ok(WorkerOutcome {
         failed: closing && !close_requested,
         peer_fin: input_fin,
@@ -3098,13 +3828,23 @@ enum ChannelRequestKind {
     Exec(String),
     Shell,
     Subsystem(String),
-    Pty { valid: bool },
+    Pty {
+        term: String,
+        cols: u32,
+        rows: u32,
+        width: u32,
+        height: u32,
+        valid: bool,
+    },
     Signal(String),
-    WindowChange { valid: bool },
+    WindowChange {
+        cols: u32,
+        rows: u32,
+        valid: bool,
+    },
     ExitStatus,
     ExitSignal,
 }
-
 fn decode_channel_request(payload: &[u8]) -> Result<ChannelRequest> {
     let mut decoder = Decoder::new(payload);
     let channel_id = decoder.u32()?;
@@ -3121,26 +3861,23 @@ fn decode_channel_request(payload: &[u8]) -> Result<ChannelRequest> {
             name
         }),
         "pty-req" => {
-            let term = decoder.string()?;
+            let term = decoder.string()?.to_owned();
             let cols = decoder.u32()?;
             let rows = decoder.u32()?;
             let width = decoder.u32()?;
             let height = decoder.u32()?;
             let modes = decoder.bytes()?;
             ChannelRequestKind::Pty {
-                valid: !term.is_empty()
-                    && term.len() <= 64
-                    && term
-                        .as_bytes()
-                        .iter()
-                        .all(|byte| (0x20..=0x7e).contains(byte))
-                    && cols > 0
-                    && cols <= 1024
-                    && rows > 0
-                    && rows <= 1024
+                valid: valid_term(&term)
+                    && valid_pty_dims(cols, rows)
                     && width <= 8192
                     && height <= 8192
-                    && modes.is_empty(),
+                    && validate_pty_modes(modes),
+                term,
+                cols,
+                rows,
+                width,
+                height,
             }
         }
         "signal" => ChannelRequestKind::Signal(decoder.string()?.to_owned()),
@@ -3150,12 +3887,9 @@ fn decode_channel_request(payload: &[u8]) -> Result<ChannelRequest> {
             let width = decoder.u32()?;
             let height = decoder.u32()?;
             ChannelRequestKind::WindowChange {
-                valid: cols > 0
-                    && cols <= 1024
-                    && rows > 0
-                    && rows <= 1024
-                    && width <= 8192
-                    && height <= 8192,
+                valid: valid_pty_dims(cols, rows) && width <= 8192 && height <= 8192,
+                cols,
+                rows,
             }
         }
         "exit-status" => {
@@ -3196,6 +3930,34 @@ fn encode_channel_request(channel_id: u32, command: &Command) -> Result<Vec<u8>>
         }
     }
     Ok(encoder.finish())
+}
+/// Encode a `pty-req` binding request. Pixel dimensions are unspecified and
+/// the mode list is empty, matching what [`ClientSession::exec_pty`] sends.
+fn encode_pty_request(channel_id: u32, term: &str, cols: u32, rows: u32) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.u32(channel_id);
+    encoder.string("pty-req").expect("static string");
+    encoder.boolean(true);
+    encoder.string(term).expect("term length checked by caller");
+    encoder.u32(cols);
+    encoder.u32(rows);
+    encoder.u32(0);
+    encoder.u32(0);
+    encoder.bytes(&[]).expect("empty modes");
+    encoder.finish()
+}
+
+/// Encode a `window-change` resize notification.
+fn encode_window_change(channel_id: u32, cols: u32, rows: u32, want_reply: bool) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.u32(channel_id);
+    encoder.string("window-change").expect("static string");
+    encoder.boolean(want_reply);
+    encoder.u32(cols);
+    encoder.u32(rows);
+    encoder.u32(0);
+    encoder.u32(0);
+    encoder.finish()
 }
 
 fn decode_exit_notification(channel_id: u32, payload: &[u8]) -> Result<Option<ExitStatus>> {
@@ -6254,5 +7016,273 @@ mod tests {
         let _ = std::fs::remove_file(key_path);
         let _ = std::fs::remove_file(cert_path);
         let _ = std::fs::remove_file(server_key_path);
+    }
+    #[test]
+    fn pty_modes_are_parse_validated_only() {
+        assert!(validate_pty_modes(&[]));
+        assert!(validate_pty_modes(&[0]));
+        // VINTR (opcode 1) = 3, terminated by TTY_OP_END.
+        assert!(validate_pty_modes(&[1, 0, 0, 0, 3, 0]));
+        // Truncated value.
+        assert!(!validate_pty_modes(&[1, 0, 0]));
+        // Missing TTY_OP_END.
+        assert!(!validate_pty_modes(&[1, 0, 0, 0, 3]));
+        // Trailing bytes after TTY_OP_END.
+        assert!(!validate_pty_modes(&[0, 0]));
+    }
+
+    /// Open a channel, allocate a pty, bind `cat` to it, and round-trip
+    /// bytes through the terminal.
+    async fn open_pty_channel(
+        session: &mut RawSession,
+        term: &str,
+        cols: u32,
+        rows: u32,
+    ) -> (
+        FramedWriter<quinn::SendStream>,
+        FramedReader<quinn::RecvStream>,
+        u32,
+    ) {
+        let (send, recv) = session.connection.open_bi().await.unwrap();
+        let id = send.id().index() as u32;
+        let mut data_writer = FramedWriter::new(send);
+        let data_reader = FramedReader::new(recv);
+        session
+            .control_writer
+            .send(MSG_CHANNEL_OPEN, &encode_open(id))
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_OPEN_CONFIRM);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+        data_writer
+            .send(MSG_CHANNEL_DATA, &encode_channel_data(id, &[]).unwrap())
+            .await
+            .unwrap();
+        session
+            .control_writer
+            .send(
+                MSG_CHANNEL_REQUEST,
+                &encode_pty_request(id, term, cols, rows),
+            )
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_SUCCESS);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+        (data_writer, data_reader, id)
+    }
+
+    async fn bind_exec(session: &mut RawSession, id: u32, command: &str) {
+        session
+            .control_writer
+            .send(
+                MSG_CHANNEL_REQUEST,
+                &encode_channel_request(id, &Command::Exec(command.into())).unwrap(),
+            )
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_SUCCESS);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+    }
+
+    /// Read channel DATA frames until the accumulated output contains
+    /// `needle`. The pty layer may echo input and translate newlines, so
+    /// matching is by containment, not equality.
+    async fn read_until_contains(
+        data_reader: &mut FramedReader<quinn::RecvStream>,
+        id: u32,
+        needle: &[u8],
+    ) {
+        let mut output = Vec::new();
+        timeout(Duration::from_secs(5), async {
+            while !output
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                let frame = data_reader.next().await.unwrap().unwrap();
+                assert_eq!(frame.number, MSG_CHANNEL_DATA);
+                let mut decoder = Decoder::new(&frame.payload);
+                assert_eq!(decoder.u32().unwrap(), id);
+                output.extend_from_slice(decoder.bytes().unwrap());
+                decoder.finish().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn close_pty_channel(
+        session: &mut RawSession,
+        mut data_writer: FramedWriter<quinn::SendStream>,
+        mut data_reader: FramedReader<quinn::RecvStream>,
+        id: u32,
+    ) {
+        // The pty worker never exits on stdin EOF alone (the master stays
+        // open), so CLOSE carries the kill; the server replies CLOSE once
+        // the process group is gone and both FINs are observed.
+        session
+            .control_writer
+            .send(MSG_CHANNEL_EOF, &encode_channel_id(id))
+            .await
+            .unwrap();
+        data_writer.finish().await.unwrap();
+        session
+            .control_writer
+            .send(MSG_CHANNEL_CLOSE, &encode_channel_id(id))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while data_reader.next().await.unwrap().is_some() {}
+        })
+        .await
+        .unwrap();
+        session.wait_for_close(id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_req_accepted_and_echoes_over_pty() {
+        let mut session = RawSession::start(SessionConfig::default()).await;
+        let (mut data_writer, mut data_reader, id) =
+            open_pty_channel(&mut session, "xterm-256color", 80, 24).await;
+        bind_exec(&mut session, id, &test_tool("cat")).await;
+
+        data_writer
+            .send(
+                MSG_CHANNEL_DATA,
+                &encode_channel_data(id, b"hello-pty-roundtrip\n").unwrap(),
+            )
+            .await
+            .unwrap();
+        read_until_contains(&mut data_reader, id, b"hello-pty-roundtrip").await;
+
+        close_pty_channel(&mut session, data_writer, data_reader, id).await;
+        assert!(session.shutdown().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_change_resizes_pending_and_live_pty() {
+        let mut session = RawSession::start(SessionConfig::default()).await;
+        // A resize before the binding updates the pending allocation: the
+        // worker spawns with the latest size.
+        let (data_writer, mut data_reader, id) =
+            open_pty_channel(&mut session, "xterm-256color", 80, 24).await;
+        session
+            .control_writer
+            .send(
+                MSG_CHANNEL_REQUEST,
+                &encode_window_change(id, 100, 40, true),
+            )
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_SUCCESS);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+        bind_exec(
+            &mut session,
+            id,
+            &format!("{} size", test_tool("stty")),
+        )
+        .await;
+        read_until_contains(&mut data_reader, id, b"40 100").await;
+        close_pty_channel(&mut session, data_writer, data_reader, id).await;
+
+        // A resize after the binding reaches the live pty through the
+        // worker: a delayed `stty size` observes the new dimensions.
+        let (data_writer, mut data_reader, id) =
+            open_pty_channel(&mut session, "xterm-256color", 80, 24).await;
+        bind_exec(
+            &mut session,
+            id,
+            &format!("{} -c '{} 2; {} size'", test_tool("sh"), test_tool("sleep"), test_tool("stty")),
+        )
+        .await;
+        session
+            .control_writer
+            .send(
+                MSG_CHANNEL_REQUEST,
+                &encode_window_change(id, 120, 30, true),
+            )
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_SUCCESS);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+        read_until_contains(&mut data_reader, id, b"30 120").await;
+        close_pty_channel(&mut session, data_writer, data_reader, id).await;
+        assert!(session.shutdown().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_req_after_worker_start_is_refused() {
+        let mut session = RawSession::start(SessionConfig::default()).await;
+        let (mut data_writer, mut data_reader, id) = session.open_channel(&test_tool("cat")).await;
+        // A pipe worker is already running on this channel: a late pty-req
+        // must fail without disturbing the session.
+        session
+            .control_writer
+            .send(
+                MSG_CHANNEL_REQUEST,
+                &encode_pty_request(id, "xterm-256color", 80, 24),
+            )
+            .await
+            .unwrap();
+        let frame = timeout(Duration::from_secs(2), session.control_reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.number, MSG_CHANNEL_FAILURE);
+        assert_eq!(decode_channel_id(&frame.payload).unwrap(), id);
+
+        // The pipe channel still works after the refusal.
+        data_writer
+            .send(
+                MSG_CHANNEL_DATA,
+                &encode_channel_data(id, b"still-piped").unwrap(),
+            )
+            .await
+            .unwrap();
+        read_until_contains(&mut data_reader, id, b"still-piped").await;
+
+        session
+            .control_writer
+            .send(MSG_CHANNEL_EOF, &encode_channel_id(id))
+            .await
+            .unwrap();
+        data_writer.finish().await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while data_reader.next().await.unwrap().is_some() {}
+        })
+        .await
+        .unwrap();
+        session.wait_for_close(id).await;
+        session
+            .control_writer
+            .send(MSG_CHANNEL_CLOSE, &encode_channel_id(id))
+            .await
+            .unwrap();
+        assert!(session.shutdown().await.is_ok());
     }
 }
